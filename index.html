@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>Hárrison Ferreira aka harrison3000</title>
+		<meta content="text/html" charset="utf-8">
+		<style></style>
+		<meta name="google-site-verification" content="NsT25KuW4r3OVrX6nZ2Rc0pF4-4hZkKfOOMnNHtYnCw" />
+	</head>
+	<body style="margin:0;padding:0;overflow:hidden">
+		Um sitezinho de nada... Nem comecei ainda... volte depois!!!<br>
+		This is just a tiny website... I didn't even start yet.. be sure to check back later!!!<br>
+		<input id="valueX" type="number" step="0.01" value="0.03" hidden="true"><br>
+		<input id="valueY" type="number" step="0.01" value="0.01" hidden="true"><br>
+		<div id="fotodiv" style="position:absolute;top:45px;left:0px;width:256px;height:256px;margin:0;padding:0">
+			<img id="foto3000" src="minhafoto.jpg">
+		</div>
+		<script>
+		"use strict";
+		//I know, maybe not the most efficient way to do things... but who cares?
+		var pos={x:45,y:0};
+		var ang={x:-3.14,y:-3.14,vtax:0.03,vtay:0.01}; //vta = value to add
+		var alreadyClicked = false;
+
+		function reDraw(){
+			fotodiv.style.top = (pos.x.toString() + "%");
+			fotodiv.style.left = (pos.y.toString() + "%");
+			ang.x += ang.vtax;
+			ang.y += ang.vtay;
+			pos.x = ((Math.cos(ang.x) + 1)*50);
+			pos.y = ((Math.cos(ang.y) + 1)*50);
+
+			window.requestAnimationFrame(reDraw);
+		}
+		foto3000.onclick = function(){
+			if(alreadyClicked){return;}
+			valueX.hidden = false;
+			valueY.hidden = false;
+			reDraw();
+			alreadyClicked = true;
+			console.log("clickclick lick");
+		};
+		valueX.oninput = function(){
+			ang.vtax = valueX.valueAsNumber;
+		};
+		valueY.oninput = function(){
+			ang.vtay = valueY.valueAsNumber;
+		};
+
+
+		</script>
+	</body>
+</html>
+
+
+
