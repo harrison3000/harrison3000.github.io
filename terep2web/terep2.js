@@ -1,4 +1,4 @@
-// The web host's page side, an ES module (see web_main.cpp): picks a map folder (read
+// The web host's page side, an ES module (see host_web/web_main.cpp): picks a map folder (read
 // locally, nothing is uploaded), runs the game in terep2.wasm and draws it: the game's own
 // picture on a 2D canvas, or the OpenGL renderer's with WebGL 2 (webgl.js) and its text over it.
 import { webglImports } from './webgl.js';
@@ -24,7 +24,7 @@ const SCANCODES = {
 };
 
 // The little of WASI the module uses: printing (to the console), nothing else
-// (no directories: the files are in the module's memory, see web_main.cpp).
+// (no directories: the files are in the module's memory, see host_web/web_main.cpp).
 function wasiImports(getMemory) {
     const lines = { 1: '', 2: '' };
     return {
@@ -54,9 +54,6 @@ function wasiImports(getMemory) {
             view.setUint8(p, 2);    // character device
             return 0;
         },
-        fd_prestat_get: () => 8,    // EBADF: no directories
-        fd_prestat_dir_name: () => 8,
-        proc_exit(code) { throw new Error('terep2.wasm exited: ' + code); },
     };
 }
 
@@ -238,7 +235,8 @@ function stop() {
 const picture = document.createElement('canvas');
 
 // The OpenGL renderer's canvas and the text's over it: the whole window, in
-// device pixels.
+// device pixels.  When a game starts and when the window's size (or its
+// pixel ratio, another screen or a zoom) changes.
 function sizeCanvases() {
     const w = Math.max(1, Math.floor(innerWidth * devicePixelRatio));
     const h = Math.max(1, Math.floor(innerHeight * devicePixelRatio));
@@ -247,8 +245,10 @@ function sizeCanvases() {
             c.width = w;
             c.height = h;
         }
-    wasm.web_view(w, h);
+    wasm.web_canvas_size(w, h);
 }
+
+addEventListener('resize', () => { if (playing && webgl) sizeCanvases(); });
 
 // The OpenGL renderer's text (game_frame's), over its picture.
 function drawTexts() {
@@ -268,21 +268,19 @@ function drawTexts() {
 function frame(now) {
     if (!playing)
         return;
-    if (webgl)
-        sizeCanvases();
-    const p = wasm.web_advance(now - last);
+    const drawn = wasm.web_advance(now - last);
     last = now;
     playSamples();
-    if (p && webgl) {
+    if (drawn && webgl) {
         drawTexts();
         drawMinimap();
-    } else if (p) {
+    } else if (drawn) {
         const w = wasm.web_width(), h = wasm.web_height();
         if (picture.width !== w || picture.height !== h) {
             picture.width = w;
             picture.height = h;
         }
-        const pixels = new Uint8ClampedArray(wasm.memory.buffer, p, w * h * 4);
+        const pixels = new Uint8ClampedArray(wasm.memory.buffer, wasm.web_picture(), w * h * 4);
         picture.getContext('2d').putImageData(new ImageData(pixels, w, h), 0, 0);
         // as large as the window allows, keeping the shape, pixels left sharp
         const screen = $('screen'), k = Math.min(innerWidth / w, innerHeight / h);
@@ -314,7 +312,7 @@ function key(e, up) {
 
 function savePrefs() {
     try {
-        localStorage.setItem('terep2vibed', JSON.stringify({
+        localStorage.setItem('terep2web', JSON.stringify({
             scale: $('scale').value, fixice: $('fixice').checked, banner: $('banner').checked,
             sound: $('sound').checked, minimap: $('minimapOn').checked, renderer: $('renderer').value,
             distance: $('distance').value }));
@@ -323,7 +321,7 @@ function savePrefs() {
 
 function loadPrefs() {
     try {
-        const p = JSON.parse(localStorage.getItem('terep2vibed') || '{}');
+        const p = JSON.parse(localStorage.getItem('terep2web') || '{}');
         if (p.scale) $('scale').value = p.scale;
         if (p.fixice !== undefined) $('fixice').checked = p.fixice;
         if (p.banner !== undefined) $('banner').checked = p.banner;
