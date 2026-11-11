@@ -2,8 +2,9 @@
 // to their text file, raced through (the next ones and the ones after them
 // drawn over the renderer's frame, in its WebGL context, with its depth
 // buffer, after rzRender; the lap, the time over the text's canvas), and
-// made in the editor, a free camera flying over the map (editCheckpoints()
-// in the console), which shows them all.
+// made in the editor, a free camera flying over the map (from the pause
+// menu), which shows them all.  The same free camera, without the
+// editor, is the game's F6 (with the OpenGL renderer).
 //
 // The file:
 //     laps 3
@@ -38,10 +39,13 @@ function formatTime(seconds) {
     return (m ? m + 'm' : '') + (s || !m ? s + 's' : '');
 }
 
-// A checkpoint's line (LINE's match) -> its point, or null.
+// Inside the map's wall (x and y from 0 to 255): where checkpoints can be
+const insideWall = (x, y) => x >= 0 && x <= 255 && y >= 0 && y <= 255;
+
+// A checkpoint's line (LINE's match) -> its point, or null (also out of the wall).
 function point(m) {
     const fork = m[2].includes('*'), fire = /f/i.test(m[2]), v = m[3].split(',').map(Number);
-    if (v.length !== (fire ? 5 : 3) || !(v[v.length - 1] > 0))
+    if (v.length !== (fire ? 5 : 3) || !(v[v.length - 1] > 0) || !insideWall(v[0], v[1]))
         return null;
     return fire ? { n: +m[1], fork, fire, x: v[0], y: v[1], z: v[2], angle: v[3], d: v[4] }
                 : { n: +m[1], fork, fire, x: v[0], y: v[1], d: v[2] };
@@ -317,9 +321,35 @@ function questionTexture(gl) {
 // question marks and flags ({ kind, x, y }), rings of fire ({ kind, x, y,
 // z, angle, d }); arrows, question marks and flags at h over the ground
 // (FLOAT_HEIGHT without it).
+// The vertices of a disc of diameter d (Markers.set)
+const discVertices = (d) => Math.max(2, Math.ceil((d / 2 + 0.05) / STEP)) * SEGMENTS * 6;
+
+// Another Markers (shared) can lend its program and texture: only the
+// buffer is its own.  vertices: how many to make room for at first (set
+// grows it if needs be).
 class Markers {
-    constructor(gl) {
+    constructor(gl, vertices, shared = null) {
         this.gl = gl;
+        this.scratch = new Float32Array(FLOATS * vertices);    // set's vertices
+        this.shapes = [];           // the shapes set, each with its vertices: first, count
+        this.vao = gl.createVertexArray();
+        this.buffer = gl.createBuffer();
+        gl.bindVertexArray(this.vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, FLOATS * 4, 0);
+        gl.vertexAttribPointer(1, 2, gl.FLOAT, false, FLOATS * 4, 12);
+        gl.vertexAttribPointer(2, 1, gl.FLOAT, false, FLOATS * 4, 20);
+        gl.enableVertexAttribArray(0);
+        gl.enableVertexAttribArray(1);
+        gl.enableVertexAttribArray(2);
+        gl.bindVertexArray(null);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        if (shared) {
+            this.program = shared.program;
+            this.u = shared.u;
+            this.question = shared.question;
+            return;
+        }
         const shader = (type, text) => {
             const s = gl.createShader(type);
             gl.shaderSource(s, text);
@@ -338,40 +368,39 @@ class Markers {
         for (const name of ['uViewProj', 'uShift', 'uSize', 'uRight', 'uUp', 'uKind', 'uRadius', 'uHeight', 'uTime',
                             'uColor', 'uAlpha', 'uQuestion', 'uFogOn', 'uFogStart', 'uFogEnd', 'uFogOrigin', 'uFogColor'])
             this.u[name] = gl.getUniformLocation(p, name);
-        this.vao = gl.createVertexArray();
-        this.buffer = gl.createBuffer();
-        gl.bindVertexArray(this.vao);
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, FLOATS * 4, 0);
-        gl.vertexAttribPointer(1, 2, gl.FLOAT, false, FLOATS * 4, 12);
-        gl.vertexAttribPointer(2, 1, gl.FLOAT, false, FLOATS * 4, 20);
-        gl.enableVertexAttribArray(0);
-        gl.enableVertexAttribArray(1);
-        gl.enableVertexAttribArray(2);
-        gl.bindVertexArray(null);
-        gl.bindBuffer(gl.ARRAY_BUFFER, null);
         this.question = questionTexture(gl);
-        this.shapes = [];           // the shapes set, each with its vertices: first, count
     }
 
     // The shapes into the buffer, on the ground (heights).
     set(shapes, heights) {
-        const out = [];
+        let out = this.scratch, n = 0;                  // n floats written
+        const put = (v) => {                            // a vertex (FLOATS floats)
+            if (n + FLOATS > out.length) {
+                const bigger = new Float32Array(out.length * 2);
+                bigger.set(out);
+                out = this.scratch = bigger;
+            }
+            out.set(v, n);
+            n += FLOATS;
+        };
         const ground = (x, y) => groundHeight(heights, x, y);
-        const quad = (a, b, c, e) => out.push(...a, ...b, ...c, ...a, ...c, ...e);
+        const quad = (a, b, c, e) => { put(a); put(b); put(c); put(a); put(c); put(e); };
         // a billboard's four corners at the foot (x, h, y): the shader turns them to the camera
         const billboard = (x, h, y, seed) =>
             quad([x, h, y, -1, -1, seed], [x, h, y, 1, -1, seed], [x, h, y, 1, 1, seed], [x, h, y, -1, 1, seed]);
         this.shapes = shapes.map((shape) => {
             let s = shape;
-            const first = out.length / FLOATS;
-            if (s.kind === KIND_DISC) {         // ring by ring, on the ground at each vertex
+            const first = n / FLOATS;
+            if (s.kind === KIND_DISC) {         // ring by ring, on the ground at each vertex (each once)
                 const r = s.d / 2 + 0.05, rings = Math.max(2, Math.ceil(r / STEP));   // a little more: the edge's smoothing
-                const at = (ring, seg) => {
-                    const a = seg / SEGMENTS * 2 * Math.PI, rr = ring / rings * r;
-                    const lx = Math.cos(a) * rr, ly = Math.sin(a) * rr;
-                    return [s.x + lx, ground(s.x + lx, s.y + ly) + LIFT, s.y + ly, lx, ly, 0];
-                };
+                const grid = [];
+                for (let ring = 0; ring <= rings; ring++)
+                    for (let seg = 0; seg <= SEGMENTS; seg++) {
+                        const a = seg / SEGMENTS * 2 * Math.PI, rr = ring / rings * r;
+                        const lx = Math.cos(a) * rr, ly = Math.sin(a) * rr;
+                        grid.push([s.x + lx, ground(s.x + lx, s.y + ly) + LIFT, s.y + ly, lx, ly, 0]);
+                    }
+                const at = (ring, seg) => grid[ring * (SEGMENTS + 1) + seg];
                 for (let ring = 0; ring < rings; ring++)
                     for (let seg = 0; seg < SEGMENTS; seg++)
                         quad(at(ring, seg), at(ring + 1, seg), at(ring + 1, seg + 1), at(ring, seg + 1));
@@ -398,8 +427,8 @@ class Markers {
                 };
                 const half = ARROW_THICKNESS / 2;
                 for (const tri of ARROW_TOP) {
-                    for (const i of tri) out.push(...at(ARROW_OUTLINE[i], half, 1));
-                    for (const i of tri) out.push(...at(ARROW_OUTLINE[i], -half, 0.85));
+                    for (const i of tri) put(at(ARROW_OUTLINE[i], half, 1));
+                    for (const i of tri) put(at(ARROW_OUTLINE[i], -half, 0.85));
                 }
                 ARROW_OUTLINE.forEach((p, i) => {
                     const q = ARROW_OUTLINE[(i + 1) % ARROW_OUTLINE.length];
@@ -424,11 +453,11 @@ class Markers {
                     billboard(x, ground(x, y), y, (i * 0.618034) % 1);
                 }
             }
-            return { ...s, first, count: out.length / FLOATS - first };
+            return { ...s, first, count: n / FLOATS - first };
         });
         const gl = this.gl;
         gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
-        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(out), gl.DYNAMIC_DRAW);
+        gl.bufferData(gl.ARRAY_BUFFER, out, gl.DYNAMIC_DRAW, 0, n);
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
     }
 
@@ -514,8 +543,12 @@ const DEFAULT_DIAMETER = 3;
 const SPEED = 10;                   // tiles a second flying (x4 with Shift)
 const TURN = 0.0025;                // radians a pixel of the mouse
 const KEY_TURN = 1.6;               // radians a second with the arrows
+const MAP_END = 255;                // tiles: the wall, at 0 and here on both axes
+const EYE_OUT = 10, EYE_LOW = 5, EYE_OVER = 1, EYE_HIGH = 50;   // tiles: where the camera can go (see checkpointsBeforeFrame)
+const EYE_OVER_FREE = 0.1;          // tiles over the ground, the game's free camera (looking up from below)
 
 let wasm = null, glCanvas = null, markers = null;
+let previewMarkers = null;          // the editor's preview, apart: it moves every frame
 let mapName = 'checkpoints';
 let data = parseCheckpoints(EMPTY);
 let heights = null;                 // the map's, a copy (from the module's memory, which can grow)
@@ -525,6 +558,7 @@ let dirty = true;                   // the shapes' buffer is to be made again
 // up), the keys held, what is aimed at (the camera's centre on the ground).
 const ed = {
     on: false, eye: [128, 128, 20], yaw: 0, pitch: -0.5, keys: new Set(),
+    free: false,                    // the game's free camera (F6): the editor's, without the editor
     aim: null, aimed: -1, diameter: DEFAULT_DIAMETER, panel: null, text: null, status: null,
 };
 
@@ -540,7 +574,9 @@ export function startCheckpoints(module, canvas, name, text) {
     const p = wasm.web_heightmap();
     heights = new Uint8Array(wasm.memory.buffer, p, 256 * 256).slice();
     try {
-        markers ??= new Markers(canvas.getContext('webgl2'));
+        // room for 30 checkpoints of 5 tiles in the editor; the preview, one
+        markers ??= new Markers(canvas.getContext('webgl2'), 30 * discVertices(5));
+        previewMarkers ??= new Markers(canvas.getContext('webgl2'), discVertices(DEFAULT_DIAMETER * 2), markers);
     } catch (e) {
         console.error(e);
         markers = null;
@@ -551,6 +587,8 @@ export function startCheckpoints(module, canvas, name, text) {
 export function stopCheckpoints() {
     if (ed.on)
         closeEditor();
+    if (ed.free)
+        stopFreeCamera();
     wasm = null;
 }
 
@@ -732,8 +770,10 @@ const forward = () => [Math.cos(ed.pitch) * Math.cos(ed.yaw), Math.cos(ed.pitch)
 
 // Before the module advances: the editor's camera moves (ms since the last
 // animation frame) and goes to the renderer.
+const flying = () => ed.on || ed.free;
+
 export function checkpointsBeforeFrame(ms) {
-    if (!ed.on || !wasm)
+    if (!flying() || !wasm)
         return;
     const dt = Math.min(ms, 100) / 1000, k = ed.keys;
     const held = (...codes) => codes.some((c) => k.has(c));
@@ -745,16 +785,22 @@ export function checkpointsBeforeFrame(ms) {
         const along = (held('KeyW') ? 1 : 0) - (held('KeyS') ? 1 : 0);
         const side = (held('KeyD') ? 1 : 0) - (held('KeyA') ? 1 : 0);
         const up = (held('KeyE', 'Space') ? 1 : 0) - (held('KeyQ', 'KeyC') ? 1 : 0);
-        const f = forward(), c = Math.cos(ed.yaw), s = Math.sin(ed.yaw);
-        ed.eye[0] += (f[0] * along - s * side) * speed;
-        ed.eye[1] += (f[1] * along + c * side) * speed;
-        ed.eye[2] += (f[2] * along + up) * speed;
+        const c = Math.cos(ed.yaw), s = Math.sin(ed.yaw);   // W A S D on the level, where the camera turns
+        ed.eye[0] += (c * along - s * side) * speed;
+        ed.eye[1] += (s * along + c * side) * speed;
+        ed.eye[2] += up * speed;
     }
-    ed.eye[0] = Math.max(-100, Math.min(355, ed.eye[0]));
-    ed.eye[1] = Math.max(-100, Math.min(355, ed.eye[1]));
-    ed.eye[2] = Math.max(groundHeight(heights, ed.eye[0], ed.eye[1]) + 0.3, Math.min(150, ed.eye[2]));
+    // up to EYE_OUT tiles out of the wall; between EYE_LOW (and EYE_OVER the
+    // ground) and EYE_HIGH up; the game's, down to EYE_OVER_FREE over the ground
+    ed.eye[0] = Math.max(-EYE_OUT, Math.min(MAP_END + EYE_OUT, ed.eye[0]));
+    ed.eye[1] = Math.max(-EYE_OUT, Math.min(MAP_END + EYE_OUT, ed.eye[1]));
+    const ground = groundHeight(heights, ed.eye[0], ed.eye[1]);
+    const low = ed.on ? Math.max(EYE_LOW, ground + EYE_OVER) : ground + EYE_OVER_FREE;
+    ed.eye[2] = Math.min(EYE_HIGH, Math.max(low, ed.eye[2]));
     const f = forward();
     wasm.web_free_camera(1, ...ed.eye, ...f);
+    if (!ed.on)
+        return;
     ed.aim = hitGround(heights, ed.eye, f);
     // aimed: the nearest along the ray, a ring of fire it goes through or
     // the checkpoint on the ground where it lands (of those, the one whose
@@ -798,6 +844,7 @@ function ringHit(eye, dir, p) {
 // drawn over it (in the editor all of them, the one aimed at blinking, and
 // where a new one would go).
 let shown = null;                   // the shapes in the buffer, and their styles
+let edShapes = [];                  // the editor's, in the buffer
 let decalMemory = 0;                // RZ_MAX_DECALS RzDecal in the module's memory
 
 // The discs among shapes (styles: theirs) projected on the cars too, from
@@ -834,21 +881,26 @@ export function checkpointsAfterFrame() {
         projectDiscs(shown.shapes, shown.styles, view);
         return;
     }
-    const shapes = data.points.map((p) => (p.fire ? fireShape(p) : { kind: KIND_DISC, x: p.x, y: p.y, d: p.d }));
-    const preview = ed.aim && ed.aimed < 0;
-    if (preview)
-        shapes.push({ kind: KIND_DISC, x: ed.aim[0], y: ed.aim[1], d: ed.diameter });
-    markers.set(shapes, heights);               // every frame: the preview moves with the aim
-    dirty = true;                               // (and after the editor, the race's again)
+    if (dirty) {                                // the checkpoints: made again only when they change
+        edShapes = data.points.map((p) => (p.fire ? fireShape(p) : { kind: KIND_DISC, x: p.x, y: p.y, d: p.d }));
+        markers.set(edShapes, heights);
+        dirty = false;
+    }
     const pulse = 0.75 + 0.25 * Math.sin(performance.now() / 150);
     const styles = data.points.map((p, i) => ({
         color: i === ed.aimed ? COLORS.aimed : p.fork ? COLORS.fork : COLORS.normal,
         alpha: i === ed.aimed ? pulse : 1,
     }));
-    if (preview)
-        styles.push({ color: COLORS.preview, alpha: 0.5 });
     markers.draw(view, styles);
-    projectDiscs(shapes, styles, view);
+    if (ed.aim && ed.aimed < 0 && insideWall(...ed.aim)) {   // the preview, every frame: it moves with the aim
+        const shape = { kind: KIND_DISC, x: ed.aim[0], y: ed.aim[1], d: ed.diameter };
+        const style = { color: COLORS.preview, alpha: 0.5 };
+        previewMarkers.set([shape], heights);
+        previewMarkers.draw(view, [style]);
+        projectDiscs([...edShapes, shape], [...styles, style], view);
+    } else {
+        projectDiscs(edShapes, styles, view);
+    }
 }
 
 // The race's lap, checkpoint and time at the top right, on the text's canvas
@@ -956,7 +1008,7 @@ const round2 = (v) => Math.round(v * 100) / 100;
 // of the last number, all of which become forks.  A ring of fire (fire)
 // stands there just over the ground, the way through it the camera's.
 function place(fork, fire = false) {
-    if (!ed.aim)
+    if (!ed.aim || !insideWall(...ed.aim))
         return;
     const n = fork ? Math.max(1, lastNumber()) : lastNumber() + 1;
     if (fork)
@@ -997,23 +1049,48 @@ function editKey(e, up) {
     }
 }
 
-// The aimed checkpoint, or the new ones, half a tile bigger or smaller.
+// The aimed checkpoint, or the new ones, half a tile bigger or smaller: up to
+// MAX_DIAMETER here (bigger ones, from the text, stay as they are until made
+// smaller).
+const MAX_DIAMETER = 50;            // tiles: a radius of 25
+const resized = (d, sign) => (sign > 0 ? Math.max(d, Math.min(MAX_DIAMETER, d + 0.5)) : Math.max(0.5, d - 0.5));
 function resize(sign) {
     const a = ed.aimed >= 0 ? data.points[ed.aimed] : null;
     if (a) {
-        a.d = Math.max(0.5, a.d + sign * 0.5);
-        ed.diameter = a.d;
+        a.d = resized(a.d, sign);
+        ed.diameter = Math.min(a.d, MAX_DIAMETER);
         changed();
     } else {
-        ed.diameter = Math.max(0.5, ed.diameter + sign * 0.5);
+        ed.diameter = resized(ed.diameter, sign);
         showStatus();
     }
 }
 
-// The page's keys while the editor is open: true when taken (not the game's).
+// The page's keys: true when taken (not the game's).  F6 (with the OpenGL
+// renderer) turns the game's free camera on and off; while it is on, the
+// keys are its (as the editor's camera's), except F1..F5, which leave it
+// for the game's camera, and Esc.
 export function checkpointsKey(e, up) {
-    if (!ed.on)
+    if (!wasm)
         return false;
+    if (!ed.on) {
+        if (e.code === 'F6') {
+            e.preventDefault();
+            if (!up)
+                ed.free ? stopFreeCamera() : startFreeCamera();
+            return true;
+        }
+        if (!ed.free || e.code === 'Escape')
+            return false;
+        if (/^F[1-5]$/.test(e.code)) {
+            stopFreeCamera();
+            return false;
+        }
+        if (e.code !== 'F11' && e.code !== 'F12')
+            e.preventDefault();
+        if (up) ed.keys.delete(e.code); else ed.keys.add(e.code);
+        return true;
+    }
     if (e.target === ed.text)                    // typing in the text: its own
         return true;
     if (e.code === 'Escape')                     // leaves the mouse look (the browser does it), not the game
@@ -1030,7 +1107,7 @@ function buildPanel() {
     panel.innerHTML = `
       <b>Checkpoints</b> <span class="cpName"></span>
       <p class="small">Click the picture to look with the mouse (Esc frees it).
-      W A S D fly, E / Space up, Q / C down, Shift faster, arrows turn.
+      W A S D fly on the level, E / Space up, Q / C down, Shift faster, arrows turn.
       Click or Enter: a checkpoint where the cross is (the next number);
       B or Shift+click: a fork (one more of the last number). On one: F fork or not,
       + / − its number, X / Delete removes it; [ ] or the wheel: its diameter
@@ -1069,7 +1146,7 @@ function buildPanel() {
 // The mouse on the picture: pointer lock to look around; then clicks place
 // and remove, the wheel changes diameters.
 function onPointerDown(e) {
-    if (!ed.on || e.target.closest('#checkpointEditor'))
+    if (!flying() || e.target.closest('#checkpointEditor, #pause'))     // the panels: their own clicks
         return;
     e.preventDefault();                          // (which also keeps the focus where it is)
     if (document.activeElement === ed.text)
@@ -1078,6 +1155,8 @@ function onPointerDown(e) {
         glCanvas.requestPointerLock?.();
         return;
     }
+    if (!ed.on)
+        return;
     if (e.button === 0)
         place(e.shiftKey);
     else if (e.button === 2 && ed.aimed >= 0) {
@@ -1086,7 +1165,7 @@ function onPointerDown(e) {
     }
 }
 function onMouseMove(e) {
-    if (!ed.on || document.pointerLockElement !== glCanvas)
+    if (!flying() || document.pointerLockElement !== glCanvas)
         return;
     ed.yaw += e.movementX * TURN;
     ed.pitch = Math.max(-1.5, Math.min(1.5, ed.pitch - e.movementY * TURN));
@@ -1099,29 +1178,58 @@ function onWheel(e) {
 }
 const noMenu = (e) => { if (ed.on && !e.target.closest('#checkpointEditor')) e.preventDefault(); };
 
+// The free camera starts where the game's was, looking the same way.
+function cameraFromGame() {
+    const p = wasm.web_view();
+    if (!p)
+        return;
+    const v = new Float32Array(wasm.memory.buffer, p, 32);
+    if (v[15] || v[11]) {
+        ed.eye = [v[16], v[18], v[17]];
+        ed.yaw = Math.atan2(v[21], v[19]);
+        ed.pitch = Math.max(-1.5, Math.min(1.5, Math.asin(Math.max(-1, Math.min(1, v[20])))));
+    }
+}
+
+// The game's free camera (F6): the editor's flying, the game going on, its
+// fog and its terrain as they are.
+function startFreeCamera() {
+    if (!markers)
+        return;
+    cameraFromGame();
+    ed.keys.clear();
+    ed.free = true;
+    addEventListener('pointerdown', onPointerDown);
+    addEventListener('mousemove', onMouseMove);
+}
+
+function stopFreeCamera() {
+    ed.free = false;
+    ed.keys.clear();
+    if (document.pointerLockElement)
+        document.exitPointerLock();
+    removeEventListener('pointerdown', onPointerDown);
+    removeEventListener('mousemove', onMouseMove);
+    wasm?.web_free_camera(0, 0, 0, 0, 1, 0, 0);
+}
+
 function openEditor() {
     if (!wasm || !markers) {
-        console.log('editCheckpoints(): only in a game with the WebGL renderer');
         return false;
     }
+    if (ed.free)
+        stopFreeCamera();
     if (!ed.panel)
         buildPanel();
     ed.panel.querySelector('.cpName').textContent = mapName;
     ed.panel.hidden = false;
     ed.text.value = formatCheckpoints(data);
-    // the camera starts where the game's was, looking the same way
-    const p = wasm.web_view();
-    if (p) {
-        const v = new Float32Array(wasm.memory.buffer, p, 32);
-        if (v[15] || v[11]) {
-            ed.eye = [v[16], v[18], v[17]];
-            ed.yaw = Math.atan2(v[21], v[19]);
-            ed.pitch = Math.max(-1.5, Math.min(1.5, Math.asin(Math.max(-1, Math.min(1, v[20])))));
-        }
-    }
+    cameraFromGame();
     ed.keys.clear();
     ed.on = true;
+    dirty = true;                               // the buffer: the editor's shapes
     wasm.web_pause(1);
+    wasm.web_editor_view(1);
     addEventListener('pointerdown', onPointerDown);
     addEventListener('mousemove', onMouseMove);
     addEventListener('wheel', onWheel, { passive: false });
@@ -1143,10 +1251,10 @@ function closeEditor() {
     if (wasm) {
         wasm.web_free_camera(0, 0, 0, 0, 1, 0, 0);
         wasm.web_pause(0);
+        wasm.web_editor_view(0);
         startRace();                            // again: the checkpoints may have changed
     }
 }
 
-// In the console: opens the editor in the game being played (WebGL), or
-// closes it.
-globalThis.editCheckpoints = () => (ed.on ? (closeEditor(), false) : openEditor());
+// The pause menu's button: the editor in the game being played (WebGL).
+export const openCheckpointEditor = () => ed.on || openEditor();
