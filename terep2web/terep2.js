@@ -485,7 +485,7 @@ async function loadGame(files, name, withCheckpoints) {
     }
     prepareMinimap();
     if (webgl)
-        startCheckpoints(wasm, $('gl'), name, checkpoints);
+        startCheckpoints(wasm, $('gl'), name, checkpoints, quality);
     camera = 3;                         // a new game starts on the chase camera
     playing = true;
     last = performance.now();

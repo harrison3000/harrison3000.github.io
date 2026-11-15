@@ -128,7 +128,7 @@ function hitGround(heights, eye, dir, reach = 200) {
 //   and a white rim at the edge;
 //   in a race, a cylinder over the next checkpoints (and a lower one over
 //   those after them): translucent, fading upwards, stripes going up, and
-//   puffs of smoke rising around its foot;
+//   puffs of vapour around its foot, as from dry ice: from a little up, sinking and spreading out;
 //   and floating in the next ones an arrow standing on its edge (turned 90
 //   degrees around where it points), pointing to the ones after, or,
 //   before a fork, a question mark facing the camera; on the last of the
@@ -139,131 +139,172 @@ function hitGround(heights, eye, dir, reach = 200) {
 // (rzSetObjectDecals): a car in a checkpoint has its drawing on it.
 
 const KIND_DISC = 0, KIND_CYLINDER = 1, KIND_ARROW = 2, KIND_QUESTION = 3, KIND_SMOKE = 4, KIND_FLAG = 5,
-      KIND_FIRE = 6;
+      KIND_FIRE = 6, KINDS = 7;
 const FLOATS = 6;                   // a vertex: aPosition, aLocal, aSeed
+const SINK = 0.3;                   // tiles a cylinder goes into the ground (no gap on a slope)
+const NOISE_SIZE = 64;              // the noise texture's side (smoke, fire)
+const SMOKE_NEAR = [1.0, 3.0];      // tiles from the camera: no puff nearer than the first, whole from the second
+                                    // (a puff in front of the camera covers the whole screen, for a haze)
 
-const VERTEX = `#version 300 es
-layout(location = 0) in vec3 aPosition;     // world: (x, height, y); billboards: their foot
-layout(location = 1) in vec2 aLocal;        // disc: tiles from the centre; cylinder: around (0..1),
-                                            // tiles over the ground; arrow: light, tiles
-                                            // along it; billboards: the corner (-1..1); fire:
-                                            // around (0..1), tiles out of the ring
-layout(location = 2) in float aSeed;        // smoke: the puff's (0..1); arrow: tiles across (up)
+// A program per kind, from the same texts (KIND is #defined before them): each
+// has only its own code, no choosing per pixel.  The fog is worked out per
+// vertex (it changes slowly), as what is the same in a whole puff of smoke.
+const shaderHead = (kind) => `#version 300 es
+#define KIND ${kind}
+`;
+
+const VERTEX = `
+layout(location = 0) in vec3 aPosition;     // world: (x, height, y); billboards: their foot; cylinder: on the ground
+layout(location = 1) in vec2 aLocal;        // disc: tiles from the centre; cylinder: around (0..1);
+                                            // arrow: light, tiles along it; billboards: the
+                                            // corner (-1..1); fire: around (0..1), tiles out of the ring
+layout(location = 2) in float aSeed;        // smoke: the puff's (0..1); arrow: tiles across (up); cylinder: 1 at the top
 uniform mat4 uViewProj;
-uniform int   uKind;
 uniform vec3  uShift;                       // tiles (the arrow's and the question mark's bobbing)
-uniform float uSize;                        // the question mark's half size, tiles
+uniform float uSize;                        // the question mark's and the flag's half size, tiles
+uniform vec3  uCenter;                      // smoke: the checkpoint's centre (world)
+uniform float uHeight;                      // cylinder: tiles over the ground
 uniform float uTime;
 uniform vec3  uRight, uUp;                  // the camera's (billboards)
+uniform vec3  uEye;                         // the camera (smoke: it fades next to it)
+uniform int   uFogOn;
+uniform float uFogStart, uFogEnd;
+uniform vec3  uFogOrigin;
 out vec2 vLocal;
-out vec3 vWorld;
 out float vFade;                            // smoke: the puff's life (0..1); arrow: aSeed
+out float vFog;                             // 0 clear, 1 only fog
+#if KIND == 4
+out float vAcross;                          // the noise is not the same from a puff to another
+out float vPuff;                            // the whole puff's alpha
+#endif
 void main() {
     vLocal = aLocal;
-    vWorld = aPosition + uShift;
     vFade = aSeed;
-    if (uKind == 3 || uKind == 5) {
-        vWorld += (uRight * aLocal.x + uUp * aLocal.y) * uSize;
-    } else if (uKind == 4) {                // rises, grows and drifts, again and again
-        float t = fract(uTime * 0.35 + aSeed);
-        float size = 0.35 + 0.6 * t;
-        vWorld += vec3(sin(aSeed * 40.0 + uTime) * 0.15 * t, 1.6 * t + 0.1, cos(aSeed * 57.0 + uTime) * 0.15 * t)
-                + (uRight * aLocal.x + uUp * aLocal.y) * size;
-        vFade = t;
+    vec3 world = aPosition;
+#if KIND == 1
+    float h = mix(-${SINK.toFixed(2)}, uHeight, aSeed);
+    world.y += h;
+    vLocal.y = h;                           // tiles over the ground
+#elif KIND == 2
+    world += uShift;
+#elif KIND == 3 || KIND == 5
+    world += uShift + (uRight * aLocal.x + uUp * aLocal.y) * uSize;
+#elif KIND == 4                             // dry ice vapour: from a little up, sinks, spreads out
+    float t = fract(uTime * 0.3 + aSeed);
+    vec2 out2 = world.xz - uCenter.xz;              // outwards from the checkpoint's centre
+    out2 = length(out2) > 1e-4 ? normalize(out2) : vec2(1.0, 0.0);
+    float fall = smoothstep(0.0, 0.45, t);          // down to the ground in the first half...
+    float h = mix(1.2, 0.12, fall);
+    float r = 0.15 * t + 1.4 * smoothstep(0.25, 1.0, t);   // ...then away along it
+    float size = 0.3 + 0.8 * t;
+    world += vec3(out2.x * r + sin(aSeed * 40.0 + uTime) * 0.08, h, out2.y * r + cos(aSeed * 57.0 + uTime) * 0.08);
+    vPuff = sin(3.14159 * t) * 0.55
+          * smoothstep(${SMOKE_NEAR[0].toFixed(2)}, ${SMOKE_NEAR[1].toFixed(2)}, distance(world, uEye));
+    if (vPuff < 0.004) {                    // not to be seen: no pixels (all its corners go out of the screen)
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
     }
-    gl_Position = uViewProj * vec4(vWorld, 1.0);
+    world += (uRight * aLocal.x + uUp * aLocal.y) * size;
+    vFade = t;
+    vAcross = world.x * 7.0;
+#endif
+    vFog = uFogOn != 0 ? smoothstep(uFogStart, uFogEnd, length(world - uFogOrigin)) : 0.0;
+    gl_Position = uViewProj * vec4(world, 1.0);
 }`;
 
-const FRAGMENT = `#version 300 es
+const FRAGMENT = `
 precision highp float;
-precision highp int;                        // as the vertex shader's (uKind is in both)
+precision highp int;
 in vec2 vLocal;
-in vec3 vWorld;
 in float vFade;
-uniform int   uKind;                        // KIND_*
+in float vFog;
 uniform float uRadius;                      // disc
 uniform float uHeight;                      // cylinder
 uniform float uTime;                        // seconds
 uniform vec3  uColor;
 uniform float uAlpha;                       // the whole shape's (highlight, preview)
 uniform sampler2D uQuestion;                // the question mark: white, outlined
-uniform int   uFogOn;
-uniform float uFogStart, uFogEnd;
-uniform vec3  uFogOrigin, uFogColor;
+uniform sampler2D uNoise;                   // random values, a texel a cell
+uniform vec3  uFogColor;
 out vec4 fragColor;
-float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+#if KIND == 4
+in float vAcross;
+in float vPuff;
+#endif
+#if KIND == 4 || KIND == 6
+// Value noise (0..1): the texture's cells, smoothed between them (its linear filter
+// on a cubic step: one read instead of four hashes)
 float noise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
-    return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+    return textureLod(uNoise, (mod(i, ${NOISE_SIZE}.0) + f + 0.5) * ${(1 / NOISE_SIZE).toFixed(8)}, 0.0).r;
 }
+#endif
 void main() {
     vec3 color;
     float alpha;
-    if (uKind == 0) {
-        float r  = length(vLocal) / uRadius;
-        float aa = fwidth(r) + 0.002;
-        if (r > 1.0 + aa) discard;
-        float band = smoothstep(0.78 - aa, 0.78 + aa, r);
-        float rim  = smoothstep(0.92 - aa, 0.92 + aa, r);
-        float edge = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
-        color = uColor * 0.7;
-        alpha = 0.22;
-        color = mix(color, uColor, band);        alpha = mix(alpha, 0.85, band);
-        color = mix(color, vec3(1.0), rim);      alpha = mix(alpha, 0.90, rim);
-        alpha *= edge;
-    } else if (uKind == 1) {
-        float h = max(vLocal.y, 0.0);
-        float fade = pow(clamp(1.0 - h / uHeight, 0.0, 1.0), 1.5);
-        float stripe = 0.5 + 0.5 * sin((h * 0.8 - uTime * 1.2) * 6.2831853);
-        float foot = 1.0 - smoothstep(0.0, 0.5, h);         // brighter where it meets the ground
-        color = mix(uColor, vec3(1.0), 0.25 * stripe + 0.3 * foot);
-        alpha = (0.16 + 0.18 * stripe + 0.35 * foot) * fade;
-    } else if (uKind == 2) {                // waves shaped like its head, going where it points
-        float wave = 0.5 + 0.5 * sin((vLocal.y + abs(vFade) * 0.8 - uTime * 1.5) * 6.2831853 / 0.7);
-        color = mix(uColor, vec3(1.0), 0.1 + 0.4 * wave * wave) * vLocal.x;
-        alpha = 0.9;
-    } else if (uKind == 3) {
-        vec4 t = texture(uQuestion, vLocal * vec2(0.5, -0.5) + 0.5);
-        color = mix(uColor, vec3(1.0), t.r);     // the canvas's white glyph, its outline the colour
-        alpha = t.a * 0.95;
-    } else if (uKind == 5) {                // a pole on the left, the cloth waving from it
-        vec2 p = vLocal;
-        float pole = step(-0.95, p.x) * step(p.x, -0.85);
-        float u = (p.x + 0.85) / 1.8;                      // 0..1 along the cloth
-        float phase = u * 7.0 - uTime * 5.0;
-        float v = (p.y - 0.1 - sin(phase) * 0.07 * u) / 0.85;   // 0..1 up the cloth
-        float cloth = step(0.0, u) * step(u, 1.0) * step(0.0, v) * step(v, 1.0);
-        if (pole < 0.5 && cloth < 0.5) discard;
-        float white = mod(floor(u * 6.0) + floor(v * 4.0), 2.0);
-        color = pole > 0.5 ? vec3(0.75) : vec3(0.08 + 0.87 * white) * (0.8 + 0.2 * cos(phase));
-        alpha = 1.0;
-    } else if (uKind == 6) {                // the ring burning, flames going out of it
-        float off = vLocal.y;
-        float a = vLocal.x * 64.0;                         // around: 64 noise cells (the seam is hard to see)
-        float n = 0.6 * noise(vec2(a, off * 3.0 - uTime * 4.0)) + 0.4 * noise(vec2(a * 2.3, off * 6.0 - uTime * 7.0));
-        float core = 1.0 - smoothstep(0.05, 0.2, abs(off));
-        float flame = n * (1.0 - smoothstep(-0.1, 0.9, off)) * smoothstep(-0.4, -0.15, off);
-        float heat = clamp(core * (0.7 + 0.3 * n) + flame * 1.3 - 0.25 * (1.0 - n), 0.0, 1.2);
-        if (heat <= 0.01) discard;
-        color = heat < 0.5 ? mix(vec3(0.6, 0.05, 0.0), vec3(1.0, 0.45, 0.05), heat * 2.0)
-                           : mix(vec3(1.0, 0.45, 0.05), vec3(1.0, 0.95, 0.6), min(heat * 2.0 - 1.0, 1.0));
-        color = mix(color, uColor, 0.15);
-        alpha = clamp(heat * 1.3, 0.0, 1.0);
-    } else {
-        float r = length(vLocal);
-        float n = noise(vLocal * 2.5 + vec2(vFade * 3.0, vWorld.x * 7.0));
-        color = mix(vec3(0.85), uColor, 0.15);
-        alpha = (1.0 - smoothstep(0.2, 1.0, r)) * (0.4 + 0.6 * n) * sin(3.14159 * vFade) * 0.45;
-    }
-    alpha *= uAlpha;
-    if (uFogOn != 0) {
-        float fog = smoothstep(uFogStart, uFogEnd, length(vWorld - uFogOrigin));
-        color = mix(color, uFogColor, fog);
-        alpha *= 1.0 - fog;
-    }
-    fragColor = vec4(color, alpha);
+#if KIND == 0
+    float r  = length(vLocal) / uRadius;
+    float aa = fwidth(r) + 0.002;
+    if (r > 1.0 + aa) discard;
+    float band = smoothstep(0.78 - aa, 0.78 + aa, r);
+    float rim  = smoothstep(0.92 - aa, 0.92 + aa, r);
+    float edge = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+    color = uColor * 0.7;
+    alpha = 0.22;
+    color = mix(color, uColor, band);        alpha = mix(alpha, 0.85, band);
+    color = mix(color, vec3(1.0), rim);      alpha = mix(alpha, 0.90, rim);
+    alpha *= edge;
+#elif KIND == 1
+    float h = max(vLocal.y, 0.0);
+    float fade = clamp(1.0 - h / uHeight, 0.0, 1.0);
+    fade *= sqrt(fade);                                 // ^1.5
+    float stripe = 0.5 + 0.5 * sin((h * 0.8 - uTime * 1.2) * 6.2831853);
+    float foot = 1.0 - smoothstep(0.0, 0.5, h);         // brighter where it meets the ground
+    color = mix(uColor, vec3(1.0), 0.25 * stripe + 0.3 * foot);
+    alpha = (0.16 + 0.18 * stripe + 0.35 * foot) * fade;
+#elif KIND == 2                             // waves shaped like its head, going where it points
+    float wave = 0.5 + 0.5 * sin((vLocal.y + abs(vFade) * 0.8 - uTime * 1.5) * 6.2831853 / 0.7);
+    color = mix(uColor, vec3(1.0), 0.1 + 0.4 * wave * wave) * vLocal.x;
+    alpha = 0.9;
+#elif KIND == 3
+    vec4 t = texture(uQuestion, vLocal * vec2(0.5, -0.5) + 0.5);
+    color = mix(uColor, vec3(1.0), t.r);     // the canvas's white glyph, its outline the colour
+    alpha = t.a * 0.95;
+#elif KIND == 5                             // a pole on the left, the cloth waving from it
+    vec2 p = vLocal;
+    float pole = step(-0.95, p.x) * step(p.x, -0.85);
+    float u = (p.x + 0.85) / 1.8;                      // 0..1 along the cloth
+    float phase = u * 7.0 - uTime * 5.0;
+    float v = (p.y - 0.1 - sin(phase) * 0.07 * u) / 0.85;   // 0..1 up the cloth
+    float cloth = step(0.0, u) * step(u, 1.0) * step(0.0, v) * step(v, 1.0);
+    if (pole < 0.5 && cloth < 0.5) discard;
+    float white = mod(floor(u * 6.0) + floor(v * 4.0), 2.0);
+    color = pole > 0.5 ? vec3(0.75) : vec3(0.08 + 0.87 * white) * (0.8 + 0.2 * cos(phase));
+    alpha = 1.0;
+#elif KIND == 6                             // the ring burning, flames going out of it
+    float off = vLocal.y;
+    float a = vLocal.x * 64.0;                         // around: 64 noise cells
+    float n = 0.6 * noise(vec2(a, off * 3.0 - uTime * 4.0)) + 0.4 * noise(vec2(a * 2.3, off * 6.0 - uTime * 7.0));
+    float core = 1.0 - smoothstep(0.05, 0.2, abs(off));
+    float flame = n * (1.0 - smoothstep(-0.1, 0.9, off)) * smoothstep(-0.4, -0.15, off);
+    float heat = clamp(core * (0.7 + 0.3 * n) + flame * 1.3 - 0.25 * (1.0 - n), 0.0, 1.2);
+    if (heat <= 0.01) discard;
+    color = heat < 0.5 ? mix(vec3(0.6, 0.05, 0.0), vec3(1.0, 0.45, 0.05), heat * 2.0)
+                       : mix(vec3(1.0, 0.45, 0.05), vec3(1.0, 0.95, 0.6), min(heat * 2.0 - 1.0, 1.0));
+    color = mix(color, uColor, 0.15);
+    alpha = clamp(heat * 1.3, 0.0, 1.0);
+#else                                       // a puff of smoke
+    float r = length(vLocal);
+    float n = noise(vLocal * 2.5 + vec2(vFade * 3.0, vAcross));
+    color = mix(vec3(0.88, 0.92, 1.0), uColor, 0.1);    // a cold white
+    alpha = (1.0 - smoothstep(0.2, 1.0, r)) * (0.4 + 0.6 * n) * vPuff;
+#endif
+    fragColor = vec4(mix(color, uFogColor, vFog), alpha * uAlpha * (1.0 - vFog));
 }`;
+
+const UNIFORMS = ['uViewProj', 'uShift', 'uSize', 'uCenter', 'uRight', 'uUp', 'uEye', 'uRadius', 'uHeight', 'uTime',
+                  'uColor', 'uAlpha', 'uQuestion', 'uNoise', 'uFogOn', 'uFogStart', 'uFogEnd', 'uFogOrigin', 'uFogColor'];
 
 const COLORS = {
     normal:  [0.92, 0.10, 0.07],    // the wall's red
@@ -274,7 +315,6 @@ const COLORS = {
 const LIFT = 0.03;                  // tiles over the ground (and a polygon offset): no fighting with it
 const STEP = 0.25;                  // tiles between the rings of a disc
 const SEGMENTS = 48;
-const SINK = 0.3;                   // tiles a cylinder goes into the ground (no gap on a slope)
 
 // The arrow, flat, pointing along +a (a, b in tiles; centre at the origin):
 // its outline, counter-clockwise, and its face's triangles (indices); stood
@@ -285,9 +325,30 @@ const ARROW_SCALE = 1.4, ARROW_THICKNESS = 0.18;
 const FLOAT_HEIGHT = 2.5;           // tiles over the ground: the middle of the arrow, of the question mark
 const QUESTION_SIZE = 0.9;          // tiles, half the question mark's side
 const FLAG_SIZE = 1.2;              // tiles, half the flag's side (with its pole)
-const SMOKE_SPACING = 0.6;          // tiles around the foot of a cylinder between puffs
 const FIRE_IN = 0.4, FIRE_OUT = 0.9;   // tiles: the fire inside the ring, its flames out of it
-const QUESTION_TEXTURE_UNIT = 7;    // one the renderer does not use
+const NOISE_TEXTURE_UNIT = 6, QUESTION_TEXTURE_UNIT = 7;   // ones the renderer does not use
+// The smoke, by the renderer's quality: tiles around the foot of a cylinder
+// between puffs (they are what costs the most to draw: many layers of big
+// translucent pictures) and, with fewer of them, each one's alpha
+const SMOKE = {
+    high:   { spacing: 0.4, alpha: 1 },
+    medium: { spacing: 0.55, alpha: 1.2 },
+    low:    { spacing: 0.8, alpha: 1.45 },
+};
+let smoke = SMOKE.high;
+
+// The corners of a puff of smoke: an octagon around its circle (a square
+// would have a fifth more pixels, all of them clear)
+const PUFF = Array.from({ length: 8 }, (_, k) => {
+    const a = (k + 0.5) * Math.PI / 4, r = 1 / Math.cos(Math.PI / 8);
+    return [Math.cos(a) * r, Math.sin(a) * r];
+});
+
+// Around a circle, SEGMENTS steps (the last on the first)
+const AROUND = Array.from({ length: SEGMENTS + 1 }, (_, seg) => {
+    const a = seg / SEGMENTS * 2 * Math.PI;
+    return [Math.cos(a), Math.sin(a)];
+});
 
 // The question mark's texture: a white "?" outlined (the outline is
 // coloured in the shader), from a 2D canvas.
@@ -316,21 +377,86 @@ function questionTexture(gl) {
     return t;
 }
 
+// The noise's texture: a random byte a texel, repeating
+function noiseTexture(gl) {
+    const pixels = new Uint8Array(NOISE_SIZE * NOISE_SIZE);
+    let seed = 20240229;
+    for (let i = 0; i < pixels.length; i++) {
+        seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+        pixels[i] = seed >>> 23;
+    }
+    const t = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0 + NOISE_TEXTURE_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, NOISE_SIZE, NOISE_SIZE, 0, gl.RED, gl.UNSIGNED_BYTE, pixels);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.activeTexture(gl.TEXTURE0);
+    return t;
+}
+
+// The programs, a kind each ({ program, u: its uniforms' locations, frame }),
+// and the textures: all asked for first and only then checked, so that the
+// driver can compile them together.
+function markerPrograms(gl) {
+    const shader = (type, text) => {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, text);
+        gl.compileShader(s);
+        return s;
+    };
+    const started = Array.from({ length: KINDS }, (_, kind) => {
+        const p = gl.createProgram();
+        const vs = shader(gl.VERTEX_SHADER, shaderHead(kind) + VERTEX);
+        const fs = shader(gl.FRAGMENT_SHADER, shaderHead(kind) + FRAGMENT);
+        gl.attachShader(p, vs);
+        gl.attachShader(p, fs);
+        gl.linkProgram(p);
+        return { p, vs, fs };
+    });
+    const programs = started.map(({ p, vs, fs }, kind) => {
+        if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+            throw new Error(`checkpoint shader ${kind}: ` + (gl.getShaderInfoLog(vs) || gl.getShaderInfoLog(fs)
+                                                             || gl.getProgramInfoLog(p)));
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        const u = {};
+        for (const name of UNIFORMS)
+            u[name] = gl.getUniformLocation(p, name);
+        gl.useProgram(p);
+        gl.uniform1i(u.uQuestion, QUESTION_TEXTURE_UNIT);
+        gl.uniform1i(u.uNoise, NOISE_TEXTURE_UNIT);
+        return { program: p, u, frame: 0 };
+    });
+    gl.useProgram(null);
+    return { programs, question: questionTexture(gl), noise: noiseTexture(gl), frame: 0 };
+}
+
 // Shapes, each with its own vertices in one buffer: discs, cylinders and
 // smoke ({ kind, x, y, d, height }), arrows ({ kind, x, y, to: [x, y] }),
 // question marks and flags ({ kind, x, y }), rings of fire ({ kind, x, y,
 // z, angle, d }); arrows, question marks and flags at h over the ground
 // (FLOAT_HEIGHT without it).
 // The vertices of a disc of diameter d (Markers.set)
-const discVertices = (d) => Math.max(2, Math.ceil((d / 2 + 0.05) / STEP)) * SEGMENTS * 6;
+const discRings = (d) => Math.max(2, Math.ceil((d / 2 + 0.05) / STEP));   // a little more: the edge's smoothing
+const discVertices = (d) => discRings(d) * SEGMENTS * 6;
 
-// Another Markers (shared) can lend its program and texture: only the
+let discGrid = new Float32Array(0); // a disc's vertices, each once (Markers.set)
+// One of them (at v in the grid) to the vertices, at n: where the next one goes
+function discCorner(out, n, grid, v) {
+    out[n] = grid[v]; out[n + 1] = grid[v + 1]; out[n + 2] = grid[v + 2];
+    out[n + 3] = grid[v + 3]; out[n + 4] = grid[v + 4]; out[n + 5] = 0;
+    return n + FLOATS;
+}
+
+// Another Markers (shared) can lend its programs and textures: only the
 // buffer is its own.  vertices: how many to make room for at first (set
 // grows it if needs be).
 class Markers {
     constructor(gl, vertices, shared = null) {
         this.gl = gl;
-        this.scratch = new Float32Array(FLOATS * vertices);    // set's vertices
+        this.out = new Float32Array(FLOATS * vertices);    // set's vertices
+        this.n = 0;                 // floats of them written
         this.shapes = [];           // the shapes set, each with its vertices: first, count
         this.vao = gl.createVertexArray();
         this.buffer = gl.createBuffer();
@@ -344,120 +470,133 @@ class Markers {
         gl.enableVertexAttribArray(2);
         gl.bindVertexArray(null);
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
-        if (shared) {
-            this.program = shared.program;
-            this.u = shared.u;
-            this.question = shared.question;
-            return;
-        }
-        const shader = (type, text) => {
-            const s = gl.createShader(type);
-            gl.shaderSource(s, text);
-            gl.compileShader(s);
-            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
-                throw new Error('checkpoint shader: ' + gl.getShaderInfoLog(s));
-            return s;
-        };
-        const p = this.program = gl.createProgram();
-        gl.attachShader(p, shader(gl.VERTEX_SHADER, VERTEX));
-        gl.attachShader(p, shader(gl.FRAGMENT_SHADER, FRAGMENT));
-        gl.linkProgram(p);
-        if (!gl.getProgramParameter(p, gl.LINK_STATUS))
-            throw new Error('checkpoint shader: ' + gl.getProgramInfoLog(p));
-        this.u = {};
-        for (const name of ['uViewProj', 'uShift', 'uSize', 'uRight', 'uUp', 'uKind', 'uRadius', 'uHeight', 'uTime',
-                            'uColor', 'uAlpha', 'uQuestion', 'uFogOn', 'uFogStart', 'uFogEnd', 'uFogOrigin', 'uFogColor'])
-            this.u[name] = gl.getUniformLocation(p, name);
-        this.question = questionTexture(gl);
+        this.shared = shared ? shared.shared : markerPrograms(gl);
     }
 
-    // The shapes into the buffer, on the ground (heights).
+    // Room for more vertices after the ones written
+    reserve(vertices) {
+        const need = this.n + vertices * FLOATS;
+        if (need > this.out.length) {
+            const bigger = new Float32Array(Math.max(need, this.out.length * 2));
+            bigger.set(this.out.subarray(0, this.n));
+            this.out = bigger;
+        }
+    }
+
+    // A vertex
+    put(x, h, y, lx, ly, seed) {
+        const out = this.out, n = this.n;
+        out[n] = x; out[n + 1] = h; out[n + 2] = y; out[n + 3] = lx; out[n + 4] = ly; out[n + 5] = seed;
+        this.n = n + FLOATS;
+    }
+
+    // The shapes into the buffer, on the ground (heights); each gets its
+    // vertices (first, count).  Written straight into the array, nothing
+    // made on the way: it is done in the middle of a race, at each checkpoint.
     set(shapes, heights) {
-        let out = this.scratch, n = 0;                  // n floats written
-        const put = (v) => {                            // a vertex (FLOATS floats)
-            if (n + FLOATS > out.length) {
-                const bigger = new Float32Array(out.length * 2);
-                bigger.set(out);
-                out = this.scratch = bigger;
-            }
-            out.set(v, n);
-            n += FLOATS;
-        };
-        const ground = (x, y) => groundHeight(heights, x, y);
-        const quad = (a, b, c, e) => { put(a); put(b); put(c); put(a); put(c); put(e); };
-        // a billboard's four corners at the foot (x, h, y): the shader turns them to the camera
-        const billboard = (x, h, y, seed) =>
-            quad([x, h, y, -1, -1, seed], [x, h, y, 1, -1, seed], [x, h, y, 1, 1, seed], [x, h, y, -1, 1, seed]);
-        this.shapes = shapes.map((shape) => {
-            let s = shape;
-            const first = n / FLOATS;
+        this.n = 0;
+        this.shapes = shapes;
+        for (const s of shapes) {
+            s.first = this.n / FLOATS;
             if (s.kind === KIND_DISC) {         // ring by ring, on the ground at each vertex (each once)
-                const r = s.d / 2 + 0.05, rings = Math.max(2, Math.ceil(r / STEP));   // a little more: the edge's smoothing
-                const grid = [];
+                const rings = discRings(s.d), r = s.d / 2 + 0.05, cols = SEGMENTS + 1;
+                if (discGrid.length < (rings + 1) * cols * 5)
+                    discGrid = new Float32Array((rings + 1) * cols * 5);
+                const grid = discGrid;
+                let g = 0;
                 for (let ring = 0; ring <= rings; ring++)
-                    for (let seg = 0; seg <= SEGMENTS; seg++) {
-                        const a = seg / SEGMENTS * 2 * Math.PI, rr = ring / rings * r;
-                        const lx = Math.cos(a) * rr, ly = Math.sin(a) * rr;
-                        grid.push([s.x + lx, ground(s.x + lx, s.y + ly) + LIFT, s.y + ly, lx, ly, 0]);
+                    for (let seg = 0; seg <= SEGMENTS; seg++, g += 5) {
+                        const rr = ring / rings * r, lx = AROUND[seg][0] * rr, ly = AROUND[seg][1] * rr;
+                        grid[g] = s.x + lx;
+                        grid[g + 1] = groundHeight(heights, s.x + lx, s.y + ly) + LIFT;
+                        grid[g + 2] = s.y + ly;
+                        grid[g + 3] = lx;
+                        grid[g + 4] = ly;
                     }
-                const at = (ring, seg) => grid[ring * (SEGMENTS + 1) + seg];
+                this.reserve(rings * SEGMENTS * 6);
+                const out = this.out;
+                let n = this.n;
                 for (let ring = 0; ring < rings; ring++)
-                    for (let seg = 0; seg < SEGMENTS; seg++)
-                        quad(at(ring, seg), at(ring + 1, seg), at(ring + 1, seg + 1), at(ring, seg + 1));
-            } else if (s.kind === KIND_CYLINDER) {   // the wall, from under the ground at its edge up
+                    for (let seg = 0; seg < SEGMENTS; seg++) {
+                        const a = (ring * cols + seg) * 5, b = a + cols * 5;   // this ring's, the next one's
+                        n = discCorner(out, n, grid, a);
+                        n = discCorner(out, n, grid, b);
+                        n = discCorner(out, n, grid, b + 5);
+                        n = discCorner(out, n, grid, a);
+                        n = discCorner(out, n, grid, b + 5);
+                        n = discCorner(out, n, grid, a + 5);
+                    }
+                this.n = n;
+            } else if (s.kind === KIND_CYLINDER) {   // the wall, from under the ground at its edge up (the shader: how far)
                 const r = s.d / 2;
-                const at = (seg, top) => {
-                    const a = seg / SEGMENTS * 2 * Math.PI, x = s.x + Math.cos(a) * r, y = s.y + Math.sin(a) * r;
-                    const h = top ? s.height : -SINK;
-                    return [x, ground(x, y) + h, y, seg / SEGMENTS, h, 0];
-                };
-                for (let seg = 0; seg < SEGMENTS; seg++)
-                    quad(at(seg, false), at(seg + 1, false), at(seg + 1, true), at(seg, true));
+                this.reserve(SEGMENTS * 6);
+                for (let seg = 0; seg < SEGMENTS; seg++) {
+                    const x0 = s.x + AROUND[seg][0] * r, y0 = s.y + AROUND[seg][1] * r;
+                    const x1 = s.x + AROUND[seg + 1][0] * r, y1 = s.y + AROUND[seg + 1][1] * r;
+                    const h0 = groundHeight(heights, x0, y0), h1 = groundHeight(heights, x1, y1);
+                    const a0 = seg / SEGMENTS, a1 = (seg + 1) / SEGMENTS;
+                    this.put(x0, h0, y0, a0, 0, 0); this.put(x1, h1, y1, a1, 0, 0); this.put(x1, h1, y1, a1, 0, 1);
+                    this.put(x0, h0, y0, a0, 0, 0); this.put(x1, h1, y1, a1, 0, 1); this.put(x0, h0, y0, a0, 0, 1);
+                }
             } else if (s.kind === KIND_ARROW) {      // both faces and the edges, lit by a fixed amount each
                 let fx = s.to[0] - s.x, fy = s.to[1] - s.y;
                 const len = Math.hypot(fx, fy) || 1;
                 fx /= len;
                 fy /= len;
-                s = { ...s, along: [fx, 0, fy] };       // (world) where it bobs
-                const y0 = ground(s.x, s.y) + (s.h ?? FLOAT_HEIGHT);
+                s.along = [fx, 0, fy];                  // (world) where it bobs
+                const y0 = groundHeight(heights, s.x, s.y) + (s.h ?? FLOAT_HEIGHT);
                 const at = ([a, b], c, light) => {      // b: up; c: across, the thickness
                     a *= ARROW_SCALE;
                     b *= ARROW_SCALE;
-                    return [s.x + a * fx - c * fy, y0 + b, s.y + a * fy + c * fx, light, a, b];
+                    this.put(s.x + a * fx - c * fy, y0 + b, s.y + a * fy + c * fx, light, a, b);
                 };
                 const half = ARROW_THICKNESS / 2;
+                this.reserve((ARROW_TOP.length + ARROW_OUTLINE.length) * 6);
                 for (const tri of ARROW_TOP) {
-                    for (const i of tri) put(at(ARROW_OUTLINE[i], half, 1));
-                    for (const i of tri) put(at(ARROW_OUTLINE[i], -half, 0.85));
+                    for (const i of tri) at(ARROW_OUTLINE[i], half, 1);
+                    for (const i of tri) at(ARROW_OUTLINE[i], -half, 0.85);
                 }
                 ARROW_OUTLINE.forEach((p, i) => {
                     const q = ARROW_OUTLINE[(i + 1) % ARROW_OUTLINE.length];
-                    quad(at(p, -half, 0.7), at(q, -half, 0.7), at(q, half, 0.7), at(p, half, 0.7));
+                    at(p, -half, 0.7); at(q, -half, 0.7); at(q, half, 0.7);
+                    at(p, -half, 0.7); at(q, half, 0.7); at(p, half, 0.7);
                 });
             } else if (s.kind === KIND_QUESTION || s.kind === KIND_FLAG) {
-                billboard(s.x, ground(s.x, s.y) + (s.h ?? FLOAT_HEIGHT), s.y, 0);
+                // a billboard's four corners at the foot (x, h, y): the shader turns them to the camera
+                const h = groundHeight(heights, s.x, s.y) + (s.h ?? FLOAT_HEIGHT);
+                this.reserve(6);
+                this.put(s.x, h, s.y, -1, -1, 0); this.put(s.x, h, s.y, 1, -1, 0); this.put(s.x, h, s.y, 1, 1, 0);
+                this.put(s.x, h, s.y, -1, -1, 0); this.put(s.x, h, s.y, 1, 1, 0); this.put(s.x, h, s.y, -1, 1, 0);
             } else if (s.kind === KIND_FIRE) {       // a band around the ring, upright, across the way through it
-                const r = s.d / 2, rad = s.angle * Math.PI / 180, h = ground(s.x, s.y) + s.z;
+                const r = s.d / 2, rad = s.angle * Math.PI / 180, h = groundHeight(heights, s.x, s.y) + s.z;
                 const sx = -Math.sin(rad), sy = Math.cos(rad);   // the ring's sideways, on the map
                 const at = (seg, off) => {
-                    const a = seg / SEGMENTS * 2 * Math.PI, rr = r + off;
-                    const side = Math.cos(a) * rr;
-                    return [s.x + sx * side, h + Math.sin(a) * rr, s.y + sy * side, seg / SEGMENTS, off, 0];
+                    const rr = r + off, side = AROUND[seg][0] * rr;
+                    this.put(s.x + sx * side, h + AROUND[seg][1] * rr, s.y + sy * side, seg / SEGMENTS, off, 0);
                 };
-                for (let seg = 0; seg < SEGMENTS; seg++)
-                    quad(at(seg, -FIRE_IN), at(seg + 1, -FIRE_IN), at(seg + 1, FIRE_OUT), at(seg, FIRE_OUT));
+                this.reserve(SEGMENTS * 6);
+                for (let seg = 0; seg < SEGMENTS; seg++) {
+                    at(seg, -FIRE_IN); at(seg + 1, -FIRE_IN); at(seg + 1, FIRE_OUT);
+                    at(seg, -FIRE_IN); at(seg + 1, FIRE_OUT); at(seg, FIRE_OUT);
+                }
             } else {                                // smoke: puffs around the foot, each its own time
-                const r = s.d / 2, n = Math.max(6, Math.round(2 * Math.PI * r / SMOKE_SPACING));
-                for (let i = 0; i < n; i++) {
-                    const a = (i + 0.5) / n * 2 * Math.PI, x = s.x + Math.cos(a) * r, y = s.y + Math.sin(a) * r;
-                    billboard(x, ground(x, y), y, (i * 0.618034) % 1);
+                const r = s.d / 2, puffs = Math.max(6, Math.round(2 * Math.PI * r / smoke.spacing));
+                this.reserve(puffs * (PUFF.length - 2) * 3);
+                for (let i = 0; i < puffs; i++) {
+                    const a = (i + 0.5) / puffs * 2 * Math.PI, x = s.x + Math.cos(a) * r, y = s.y + Math.sin(a) * r;
+                    const h = groundHeight(heights, x, y), seed = (i * 0.618034) % 1;
+                    for (let k = 1; k < PUFF.length - 1; k++) {     // a fan from its first corner
+                        this.put(x, h, y, PUFF[0][0], PUFF[0][1], seed);
+                        this.put(x, h, y, PUFF[k][0], PUFF[k][1], seed);
+                        this.put(x, h, y, PUFF[k + 1][0], PUFF[k + 1][1], seed);
+                    }
                 }
             }
-            return { ...s, first, count: n / FLOATS - first };
-        });
+            s.count = this.n / FLOATS - s.first;
+        }
         const gl = this.gl;
         gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
-        gl.bufferData(gl.ARRAY_BUFFER, out, gl.DYNAMIC_DRAW, 0, n);
+        gl.bufferData(gl.ARRAY_BUFFER, this.out, gl.DYNAMIC_DRAW, 0, this.n);
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
     }
 
@@ -466,26 +605,16 @@ class Markers {
     // is left as it sets it up again each frame (no program, no VAO bound,
     // no blending, depth written, texture unit 0 active).
     draw(view, styles) {
-        const gl = this.gl, u = this.u, time = performance.now() / 1000;
+        const shapes = this.shapes;
+        if (!shapes.length)
+            return;
+        const gl = this.gl, shared = this.shared, time = performance.now() / 1000;
+        const frame = ++shared.frame;
         // the camera's right and up, for the billboards (from where it looks; up stays up)
-        const f = [view[19], view[20], view[21]];
-        let r = [-f[2], 0, f[0]];
-        const rl = Math.hypot(r[0], r[2]) || 1;
-        r = [r[0] / rl, 0, r[2] / rl];
-        const up = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]];
-        gl.useProgram(this.program);
-        gl.uniformMatrix4fv(u.uViewProj, false, view.subarray(0, 16));
-        gl.uniform1f(u.uTime, time);
-        gl.uniform3fv(u.uRight, r);
-        gl.uniform3fv(u.uUp, up);
-        gl.uniform1i(u.uQuestion, QUESTION_TEXTURE_UNIT);
-        gl.activeTexture(gl.TEXTURE0 + QUESTION_TEXTURE_UNIT);
-        gl.bindTexture(gl.TEXTURE_2D, this.question);
-        gl.uniform1i(u.uFogOn, view[22]);
-        gl.uniform3f(u.uFogOrigin, view[23], view[24], view[25]);
-        gl.uniform1f(u.uFogStart, view[26]);
-        gl.uniform1f(u.uFogEnd, view[27]);
-        gl.uniform3f(u.uFogColor, view[28], view[29], view[30]);
+        const fx = view[19], fy = view[20], fz = view[21], rl = Math.hypot(fx, fz) || 1;
+        const rx = -fz / rl, rz = fx / rl;                      // right: (rx, 0, rz)
+        const ux = -rz * fy, uy = rz * fx - rx * fz, uz = rx * fy;
+        const bob = 0.25 * Math.sin(time * 3);      // the arrow back and forth, the question mark up and down
         gl.bindVertexArray(this.vao);
         gl.enable(gl.DEPTH_TEST);
         gl.depthMask(false);
@@ -494,32 +623,76 @@ class Markers {
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
         gl.colorMask(true, true, true, false);
         gl.polygonOffset(-1, -4);
-        this.shapes.forEach((s, k) => {
-            const style = styles[k];
-            if (s.kind === KIND_DISC)
-                gl.enable(gl.POLYGON_OFFSET_FILL);
-            else
-                gl.disable(gl.POLYGON_OFFSET_FILL);
-            gl.blendFunc(gl.SRC_ALPHA, s.kind === KIND_FIRE ? gl.ONE : gl.ONE_MINUS_SRC_ALPHA);
-            gl.uniform1i(u.uKind, s.kind);
-            gl.uniform1f(u.uRadius, s.d / 2);
-            gl.uniform1f(u.uHeight, s.height || 1);
-            const bob = 0.25 * Math.sin(time * 3);      // the arrow back and forth, the question mark up and down
-            gl.uniform3fv(u.uShift, s.kind === KIND_ARROW ? s.along.map((v) => v * bob)
-                                  : s.kind === KIND_QUESTION ? [0, bob, 0] : [0, 0, 0]);
-            gl.uniform1f(u.uSize, s.kind === KIND_FLAG ? FLAG_SIZE : QUESTION_SIZE);
-            gl.uniform3fv(u.uColor, style.color);
+        let kind = -1, u = null, offset = false, glow = false, textures = false;
+        for (let k = 0; k < shapes.length; k++) {
+            const s = shapes[k], style = styles[k];
+            if (!s.count)
+                continue;
+            if (s.kind !== kind) {                  // its program, with the frame's uniforms (once a frame)
+                kind = s.kind;
+                const p = shared.programs[kind];
+                u = p.u;
+                gl.useProgram(p.program);
+                if (p.frame !== frame) {
+                    p.frame = frame;
+                    gl.uniformMatrix4fv(u.uViewProj, false, view, 0, 16);
+                    gl.uniform1i(u.uFogOn, view[22]);
+                    gl.uniform3f(u.uFogOrigin, view[23], view[24], view[25]);
+                    gl.uniform1f(u.uFogStart, view[26]);
+                    gl.uniform1f(u.uFogEnd, view[27]);
+                    gl.uniform3f(u.uFogColor, view[28], view[29], view[30]);
+                    if (kind !== KIND_DISC && kind !== KIND_QUESTION)
+                        gl.uniform1f(u.uTime, time);
+                    if (kind === KIND_QUESTION || kind === KIND_FLAG || kind === KIND_SMOKE) {
+                        gl.uniform3f(u.uRight, rx, 0, rz);
+                        gl.uniform3f(u.uUp, ux, uy, uz);
+                    }
+                    if (kind === KIND_SMOKE)
+                        gl.uniform3f(u.uEye, view[16], view[17], view[18]);
+                    if (kind === KIND_QUESTION)
+                        gl.uniform1f(u.uSize, QUESTION_SIZE);
+                    else if (kind === KIND_FLAG)
+                        gl.uniform1f(u.uSize, FLAG_SIZE);
+                }
+                if (!textures && (kind === KIND_QUESTION || kind === KIND_SMOKE || kind === KIND_FIRE)) {
+                    gl.activeTexture(gl.TEXTURE0 + QUESTION_TEXTURE_UNIT);
+                    gl.bindTexture(gl.TEXTURE_2D, shared.question);
+                    gl.activeTexture(gl.TEXTURE0 + NOISE_TEXTURE_UNIT);
+                    gl.bindTexture(gl.TEXTURE_2D, shared.noise);
+                    textures = true;
+                }
+                if (offset !== (kind === KIND_DISC)) {
+                    offset = !offset;
+                    if (offset) gl.enable(gl.POLYGON_OFFSET_FILL); else gl.disable(gl.POLYGON_OFFSET_FILL);
+                }
+                if (glow !== (kind === KIND_FIRE)) {            // the fire: added to what is behind
+                    glow = !glow;
+                    gl.blendFunc(gl.SRC_ALPHA, glow ? gl.ONE : gl.ONE_MINUS_SRC_ALPHA);
+                }
+            }
+            if (kind === KIND_DISC)
+                gl.uniform1f(u.uRadius, s.d / 2);
+            else if (kind === KIND_CYLINDER)
+                gl.uniform1f(u.uHeight, s.height || 1);
+            else if (kind === KIND_ARROW)
+                gl.uniform3f(u.uShift, s.along[0] * bob, 0, s.along[2] * bob);
+            else if (kind === KIND_QUESTION)
+                gl.uniform3f(u.uShift, 0, bob, 0);
+            else if (kind === KIND_SMOKE)
+                gl.uniform3f(u.uCenter, s.x, 0, s.y);
+            gl.uniform3f(u.uColor, style.color[0], style.color[1], style.color[2]);
             gl.uniform1f(u.uAlpha, style.alpha);
             gl.drawArrays(gl.TRIANGLES, s.first, s.count);
-        });
-        gl.disable(gl.POLYGON_OFFSET_FILL);
+        }
+        if (offset)
+            gl.disable(gl.POLYGON_OFFSET_FILL);
         gl.colorMask(true, true, true, true);
         gl.disable(gl.BLEND);
         gl.depthMask(true);
         gl.bindVertexArray(null);
         gl.useProgram(null);
-        gl.bindTexture(gl.TEXTURE_2D, null);
-        gl.activeTexture(gl.TEXTURE0);
+        if (textures)
+            gl.activeTexture(gl.TEXTURE0);
     }
 }
 
@@ -563,10 +736,13 @@ const ed = {
 };
 
 // A game starts with the OpenGL renderer (its canvas, the module's exports,
-// the map's name, the text of its checkpoints file or null).
-export function startCheckpoints(module, canvas, name, text) {
+// the map's name, the text of its checkpoints file or null, the renderer's
+// quality: 'high', 'medium' or 'low').
+export function startCheckpoints(module, canvas, name, text, quality = 'high') {
     wasm = module;
     glCanvas = canvas;
+    smoke = SMOKE[quality] ?? SMOKE.high;
+    decalsSentCount = -1;
     mapName = name || 'checkpoints';
     data = parseCheckpoints(text ?? EMPTY);
     if (data.errors.length)
@@ -589,12 +765,14 @@ export function stopCheckpoints() {
         closeEditor();
     if (ed.free)
         stopFreeCamera();
+    raceHud(null);
     wasm = null;
 }
 
 export const editingCheckpoints = () => ed.on;
-// Whether the text's canvas has something of this module's every frame
-export const checkpointsOverlayOn = () => ed.on || race.on;
+// Whether the text's canvas has something of this module's every frame (the
+// editor's labels; the race's text has a small canvas of its own)
+export const checkpointsOverlayOn = () => ed.on;
 
 // ---------------------------------------------------------------------------
 // The race: the checkpoints in their order, lap after lap (a lap ends at the
@@ -610,6 +788,7 @@ const AFTER_ALPHA = 0.6;
 const race = {
     on: false,
     numbers: [],                    // the checkpoints' numbers, in order (one lap)
+    groups: [],                     // for each of them, its checkpoints (one, or the forks)
     step: 0, total: 0,              // checkpoints passed, of laps x numbers
     start: 0, finish: null,         // in ticks (web_ticks)
     last: null,                     // where the car's wheels were at the last frame
@@ -618,6 +797,7 @@ const race = {
 // From the start, with the checkpoints as they are now.
 function startRace() {
     race.numbers = [...new Set(data.points.map((p) => p.n))].sort((a, b) => a - b);
+    race.groups = race.numbers.map((n) => data.points.filter((p) => p.n === n));
     race.total = race.numbers.length * Math.max(1, data.laps);
     race.on = race.total > 0;
     race.step = 0;
@@ -629,8 +809,8 @@ function startRace() {
 
 // The checkpoints to pass at a step (one, or the forks of a number); none
 // after the last.
-const checkpointsAt = (step) => step < race.total
-    ? data.points.filter((p) => p.n === race.numbers[step % race.numbers.length]) : [];
+const NONE = [];
+const checkpointsAt = (step) => (step < race.total ? race.groups[step % race.groups.length] : NONE);
 
 // The distance from the point p to the segment a-b (2D).
 function segmentDistance(a, b, p) {
@@ -713,7 +893,7 @@ function raceShapes() {
             }
             add({ kind: KIND_DISC, x: p.x, y: p.y, d: p.d }, p, alpha);
             add({ kind: KIND_CYLINDER, x: p.x, y: p.y, d: p.d, height }, p, alpha);
-            add({ kind: KIND_SMOKE, x: p.x, y: p.y, d: p.d }, p, alpha);
+            add({ kind: KIND_SMOKE, x: p.x, y: p.y, d: p.d }, p, alpha * smoke.alpha);
         }
     for (const [list, step, alpha] of [[next, race.step, 1], [after, race.step + 1, AFTER_ALPHA]])
         if (step === race.total - 1)                // the race's last
@@ -845,30 +1025,82 @@ function ringHit(eye, dir, p) {
 // where a new one would go).
 let shown = null;                   // the shapes in the buffer, and their styles
 let edShapes = [];                  // the editor's, in the buffer
+let edStyles = [];                  // and their styles, set each frame
 let decalMemory = 0;                // RZ_MAX_DECALS RzDecal in the module's memory
+const PREVIEW_STYLE = { color: COLORS.preview, alpha: 0.5 };
+const previewShape = { kind: KIND_DISC, x: 0, y: 0, d: 0 }, previewShapes = [previewShape], previewStyles = [PREVIEW_STYLE];
 
-// The discs among shapes (styles: theirs) projected on the cars too, from
-// the next frame: the nearest to the camera, as many as the renderer takes.
+// The module's memory as floats, and the renderer's camera in it: the same
+// arrays until the memory grows (nothing made each frame)
+let memoryFloats = null, viewFloats = null, viewAt = 0;
+function floats() {
+    if (memoryFloats?.buffer !== wasm.memory.buffer)
+        memoryFloats = new Float32Array(wasm.memory.buffer);
+    return memoryFloats;
+}
+// The renderer's camera of the last frame (rzGetView's floats), or null before one
+function lastView() {
+    const p = wasm.web_view();
+    if (!p)
+        return null;
+    if (viewFloats?.buffer !== wasm.memory.buffer || viewAt !== p) {
+        viewFloats = new Float32Array(wasm.memory.buffer, p, 32);
+        viewAt = p;
+    }
+    return viewFloats[15] === 0 && viewFloats[11] === 0 ? null : viewFloats;
+}
+
+// The discs among shapes (styles: theirs; and one more, or null) projected on
+// the cars too, from the next frame: the nearest to the camera, as many as the
+// renderer takes.  Told to the renderer only when they change.
 const MAX_DECALS = 4;
-function projectDiscs(shapes, styles, view) {
-    const discs = shapes.map((s, k) => [s, styles[k]]).filter(([s]) => s.kind === KIND_DISC)
-        .sort(([a], [b]) => Math.hypot(a.x - view[16], a.y - view[18]) - Math.hypot(b.x - view[16], b.y - view[18]))
-        .slice(0, MAX_DECALS);
+const decals = new Float32Array(MAX_DECALS * 8), decalsSent = new Float32Array(MAX_DECALS * 8);
+let decalsSentCount = -1;           // -1: none sent in this game
+const decalShapes = [null, null, null, null], decalStyles = [null, null, null, null];
+function projectDiscs(shapes, styles, view, more = null, moreStyle = null) {
+    const ex = view[16], ey = view[18];
+    let count = 0;
+    for (let k = 0; k <= shapes.length; k++) {          // the last: the one more
+        const s = k < shapes.length ? shapes[k] : more;
+        if (!s || s.kind !== KIND_DISC)
+            continue;
+        const d = Math.hypot(s.x - ex, s.y - ey);
+        let at = count;                                 // where it goes, the nearest first
+        while (at > 0 && Math.hypot(decalShapes[at - 1].x - ex, decalShapes[at - 1].y - ey) > d)
+            at--;
+        if (at >= MAX_DECALS)
+            continue;
+        count = Math.min(count + 1, MAX_DECALS);
+        for (let i = count - 1; i > at; i--) {
+            decalShapes[i] = decalShapes[i - 1];
+            decalStyles[i] = decalStyles[i - 1];
+        }
+        decalShapes[at] = s;
+        decalStyles[at] = k < shapes.length ? styles[k] : moreStyle;
+    }
+    let same = count === decalsSentCount;
+    for (let i = 0; i < count; i++) {
+        const s = decalShapes[i], style = decalStyles[i], b = i * 8;
+        decals[b] = s.x; decals[b + 1] = s.y; decals[b + 2] = s.d / 2; decals[b + 3] = style.alpha;
+        decals[b + 4] = style.color[0]; decals[b + 5] = style.color[1]; decals[b + 6] = style.color[2];
+        for (let f = b; f < b + 7 && same; f++)
+            same = decals[f] === decalsSent[f];
+    }
+    if (same)
+        return;
     decalMemory ||= wasm.web_alloc(MAX_DECALS * 32);
-    const f = new Float32Array(wasm.memory.buffer, decalMemory, MAX_DECALS * 8);
-    discs.forEach(([s, style], i) => f.set([s.x, s.y, s.d / 2, style.alpha, ...style.color, 0], i * 8));
-    wasm.web_decals(decalMemory, discs.length);
+    floats().set(decals, decalMemory >> 2);
+    wasm.web_decals(decalMemory, count);
+    decalsSent.set(decals);
+    decalsSentCount = count;
 }
 
 export function checkpointsAfterFrame() {
     if (!wasm || !markers)
         return;
     updateRace();
-    const p = wasm.web_view();
-    if (!p)
-        return;
-    const view = new Float32Array(wasm.memory.buffer, p, 32);
-    if (view[15] === 0 && view[11] === 0)       // no frame yet
+    const view = lastView();
+    if (!view)
         return;
     if (!ed.on) {
         if (dirty) {
@@ -883,73 +1115,106 @@ export function checkpointsAfterFrame() {
     }
     if (dirty) {                                // the checkpoints: made again only when they change
         edShapes = data.points.map((p) => (p.fire ? fireShape(p) : { kind: KIND_DISC, x: p.x, y: p.y, d: p.d }));
+        edStyles = data.points.map(() => ({ color: COLORS.normal, alpha: 1 }));
         markers.set(edShapes, heights);
         dirty = false;
     }
     const pulse = 0.75 + 0.25 * Math.sin(performance.now() / 150);
-    const styles = data.points.map((p, i) => ({
-        color: i === ed.aimed ? COLORS.aimed : p.fork ? COLORS.fork : COLORS.normal,
-        alpha: i === ed.aimed ? pulse : 1,
-    }));
-    markers.draw(view, styles);
+    for (let i = 0; i < edStyles.length; i++) {
+        const p = data.points[i], aimed = i === ed.aimed;
+        edStyles[i].color = aimed ? COLORS.aimed : p.fork ? COLORS.fork : COLORS.normal;
+        edStyles[i].alpha = aimed ? pulse : 1;
+    }
+    markers.draw(view, edStyles);
     if (ed.aim && ed.aimed < 0 && insideWall(...ed.aim)) {   // the preview, every frame: it moves with the aim
-        const shape = { kind: KIND_DISC, x: ed.aim[0], y: ed.aim[1], d: ed.diameter };
-        const style = { color: COLORS.preview, alpha: 0.5 };
-        previewMarkers.set([shape], heights);
-        previewMarkers.draw(view, [style]);
-        projectDiscs([...edShapes, shape], [...styles, style], view);
+        previewShape.x = ed.aim[0];
+        previewShape.y = ed.aim[1];
+        previewShape.d = ed.diameter;
+        previewMarkers.set(previewShapes, heights);
+        previewMarkers.draw(view, previewStyles);
+        projectDiscs(edShapes, edStyles, view, previewShape, PREVIEW_STYLE);
     } else {
-        projectDiscs(edShapes, styles, view);
+        projectDiscs(edShapes, edStyles, view);
     }
 }
 
-// The race's lap, checkpoint and time at the top right, on the text's canvas
-// (cleared before, see terep2.js); the target time, and at the end whether
-// it was made.
-function raceOverlay(ctx2d) {
-    const w = ctx2d.canvas.width, size = Math.max(14, ctx2d.canvas.height / 30);
-    const n = race.numbers.length, done = race.finish !== null;
-    const lines = [];
-    if (done) {
-        lines.push(['Finished ' + clock(raceSeconds()), '#fff']);
-        if (data.targetTime !== null)
-            lines.push(raceSeconds() <= data.targetTime ? ['Qualified!', '#6f6'] : ['Not qualified', '#f66'],
-                       ['Target ' + clock(data.targetTime), '#ccc']);
-    } else {
-        lines.push([`Lap ${Math.floor(race.step / n) + 1}/${Math.max(1, data.laps)}`, '#fff'],
-                   [`Checkpoint ${race.step % n + 1}/${n}`, '#fff'],
-                   [clock(raceSeconds()), '#fff']);
-        if (data.targetTime !== null)
-            lines.push(['Target ' + clock(data.targetTime), raceSeconds() > data.targetTime ? '#f66' : '#ccc']);
+// The race's lap, checkpoint and time at the top right, as they were on the
+// text's canvas (overlay: it, for its place and its pixels), but on a small
+// canvas of their own over it: the clock changes every frame, and drawing
+// the text's canvas again each time, the size of the screen, costs on a
+// phone.  The target time, and at the end whether it was made.  Without
+// overlay, hidden.
+let hud = null, hudShown = '';
+function raceHud(overlay) {
+    if (!overlay) {
+        if (hud)
+            hud.hidden = true;
+        hudShown = '';
+        return;
     }
-    ctx2d.save();
+    const w = overlay.width, h = overlay.height, size = Math.max(14, h / 30);
+    const n = race.numbers.length, done = race.finish !== null;
+    const seconds = raceSeconds(), time = clock(seconds);
+    const late = data.targetTime !== null && seconds > data.targetTime;
+    const key = `${time} ${race.step} ${done} ${late} ${w} ${h}`;
+    if (key === hudShown)
+        return;
+    hudShown = key;
+    if (!hud) {
+        hud = document.createElement('canvas');
+        hud.style.cssText = 'position: fixed; right: 0; pointer-events: none;';
+        overlay.after(hud);
+    }
+    hud.hidden = false;
+    // under the game's title (at y 10 of its 320 x 200, two lines of 7.5:
+    // gl_renderer.cpp's draw_text); pad: room for the outline over the first line
+    const top = 30 * Math.min(w / 320, h / 200), pad = Math.ceil(size * 0.25);
+    const cw = Math.ceil(size * 13), ch = Math.ceil(size * 1.2 * 4) + 2 * pad;
+    const css = (overlay.clientWidth || innerWidth) / w;      // CSS pixels a pixel of the canvases
+    if (hud.width !== cw || hud.height !== ch) {
+        hud.width = cw;
+        hud.height = ch;
+    }
+    hud.style.width = cw * css + 'px';
+    hud.style.height = ch * css + 'px';
+    hud.style.top = (top - pad) * css + 'px';
+    const ctx2d = hud.getContext('2d');
+    ctx2d.clearRect(0, 0, cw, ch);
     ctx2d.font = `bold ${size}px system-ui, sans-serif`;
     ctx2d.textAlign = 'right';
     ctx2d.textBaseline = 'top';
     ctx2d.lineWidth = size / 5;
     ctx2d.strokeStyle = '#000';
-    // under the game's title (at y 10 of its 320 x 200, two lines of 7.5:
-    // gl_renderer.cpp's draw_text)
-    const top = 30 * Math.min(w / 320, ctx2d.canvas.height / 200);
-    lines.forEach(([text, color], k) => {
-        const y = top + k * size * 1.2;
+    let y = pad;
+    const line = (text, color) => {
         ctx2d.fillStyle = color;
-        ctx2d.strokeText(text, w - size * 0.6, y);
-        ctx2d.fillText(text, w - size * 0.6, y);
-    });
-    ctx2d.restore();
+        ctx2d.strokeText(text, cw - size * 0.6, y);
+        ctx2d.fillText(text, cw - size * 0.6, y);
+        y += size * 1.2;
+    };
+    if (done) {
+        line('Finished ' + time, '#fff');
+        if (data.targetTime !== null) {
+            if (late) line('Not qualified', '#f66'); else line('Qualified!', '#6f6');
+            line('Target ' + clock(data.targetTime), '#ccc');
+        }
+    } else {
+        line(`Lap ${Math.floor(race.step / n) + 1}/${Math.max(1, data.laps)}`, '#fff');
+        line(`Checkpoint ${race.step % n + 1}/${n}`, '#fff');
+        line(time, '#fff');
+        if (data.targetTime !== null)
+            line('Target ' + clock(data.targetTime), late ? '#f66' : '#ccc');
+    }
 }
 
-// The editor's labels (each checkpoint's number) and its crosshair, or the
-// race's text, on the text's canvas (cleared before, see terep2.js).
+// The editor's labels (each checkpoint's number) and its crosshair on the
+// text's canvas (cleared before, see terep2.js), or the race's text over it.
 export function checkpointsOverlay(ctx2d) {
     if (!wasm)
         return;
-    if (!ed.on) {
-        if (race.on)
-            raceOverlay(ctx2d);
+    raceHud(race.on && !ed.on ? ctx2d.canvas : null);
+    if (!ed.on)
         return;
-    }
     const p = wasm.web_view();
     if (!p)
         return;

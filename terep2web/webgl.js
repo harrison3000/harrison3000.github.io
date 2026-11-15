@@ -14,9 +14,22 @@ export function webglImports(canvas, getMemory) {
     const locations = [];           // uniform locations: the module's number is the index
 
     const buffer = () => getMemory().buffer;
-    const i32 = () => new Int32Array(buffer());
+    // The memory as arrays of bytes, ints and floats: the same ones until the memory
+    // grows (its buffer is then another), so the frame's calls allocate nothing
+    let bytes = null, ints = null, floats = null;
+    function views() {
+        const b = buffer();
+        if (bytes?.buffer !== b) {
+            bytes = new Uint8Array(b);
+            ints = new Int32Array(b);
+            floats = new Float32Array(b);
+        }
+    }
+    const u8 = () => (views(), bytes);
+    const i32 = () => (views(), ints);
+    const f32 = () => (views(), floats);
     const decoder = new TextDecoder(), encoder = new TextEncoder();
-    const cstr = (p) => { const m = new Uint8Array(buffer()); let e = p; while (m[e]) e++; return decoder.decode(m.subarray(p, e)); };
+    const cstr = (p) => { const m = u8(); let e = p; while (m[e]) e++; return decoder.decode(m.subarray(p, e)); };
     const obj = (n) => (n ? objects.get(n)?.obj ?? null : null);
 
     function generate(n, p, create) {
@@ -44,17 +57,17 @@ export function webglImports(canvas, getMemory) {
     // reads from there what the size, format and type need)
     function pixels(type, p) {
         switch (type) {
-        case gl.FLOAT: return [new Float32Array(buffer()), p >> 2];
+        case gl.FLOAT: return [f32(), p >> 2];
         case gl.UNSIGNED_SHORT: return [new Uint16Array(buffer()), p >> 1];
         case gl.UNSIGNED_INT: return [new Uint32Array(buffer()), p >> 2];
-        default: return [new Uint8Array(buffer()), p];
+        default: return [u8(), p];
         }
     }
     // A string into the memory at p, at most max bytes with the 0
     function putString(text, max, lenp, p) {
         const b = encoder.encode(text || '').subarray(0, Math.max(0, max - 1));
         if (p && max > 0) {
-            const m = new Uint8Array(buffer());
+            const m = u8();
             m.set(b, p);
             m[p + b.length] = 0;
         }
@@ -140,12 +153,12 @@ export function webglImports(canvas, getMemory) {
         glUniform1i: (loc, v) => gl.uniform1i(locations[loc] ?? null, v),
         glUniform1f: (loc, v) => gl.uniform1f(locations[loc] ?? null, v),
         glUniform3f: (loc, x, y, z) => gl.uniform3f(locations[loc] ?? null, x, y, z),
-        glUniform3fv: (loc, count, p) => gl.uniform3fv(locations[loc] ?? null, new Float32Array(buffer()), p >> 2, count * 3),
-        glUniform4fv: (loc, count, p) => gl.uniform4fv(locations[loc] ?? null, new Float32Array(buffer()), p >> 2, count * 4),
+        glUniform3fv: (loc, count, p) => gl.uniform3fv(locations[loc] ?? null, f32(), p >> 2, count * 3),
+        glUniform4fv: (loc, count, p) => gl.uniform4fv(locations[loc] ?? null, f32(), p >> 2, count * 4),
         glGetUniformBlockIndex: (n, name) => gl.getUniformBlockIndex(obj(n), cstr(name)),
         glUniformBlockBinding: (n, block, binding) => gl.uniformBlockBinding(obj(n), block, binding),
         glUniformMatrix4fv: (loc, count, transpose, p) =>
-            gl.uniformMatrix4fv(locations[loc] ?? null, !!transpose, new Float32Array(buffer()), p >> 2, count * 16),
+            gl.uniformMatrix4fv(locations[loc] ?? null, !!transpose, f32(), p >> 2, count * 16),
 
         glGenVertexArrays: (n, p) => generate(n, p, () => gl.createVertexArray()),
         glDeleteVertexArrays: (n, p) => remove(n, p, (a) => gl.deleteVertexArray(a)),
@@ -156,12 +169,12 @@ export function webglImports(canvas, getMemory) {
         glBindBufferBase: (target, index, n) => gl.bindBufferBase(target, index, obj(n)),
         glBufferData(target, size, p, usage) {
             if (p)
-                gl.bufferData(target, new Uint8Array(buffer()), usage, p, size);
+                gl.bufferData(target, u8(), usage, p, size);
             else
                 gl.bufferData(target, size, usage);
         },
         glBufferSubData: (target, offset, size, p) =>
-            gl.bufferSubData(target, offset, new Uint8Array(buffer()), p, size),
+            gl.bufferSubData(target, offset, u8(), p, size),
         glVertexAttribPointer: (i, size, type, normalized, stride, offset) =>
             gl.vertexAttribPointer(i, size, type, !!normalized, stride, offset),
         glVertexAttribIPointer: (i, size, type, stride, offset) => gl.vertexAttribIPointer(i, size, type, stride, offset),
