@@ -3,7 +3,7 @@
 // picture on a 2D canvas, or the OpenGL renderer's with WebGL 2 (webgl.js) and its text over it.
 import { webglImports } from './webgl.js';
 import { baseName, openAnniversary, trackFiles, trackTitle } from './anniversary.js';
-import { decodeCar, decodePcx, drawCar, drawPcx } from './preview.js';
+import { decodeCar, decodePcx, drawCar, drawPcx, drawTrack } from './preview.js';
 import { checkpointsAfterFrame, checkpointsBeforeFrame, checkpointsKey, checkpointsMinimap, checkpointsOverlay, checkpointsOverlayOn, editingCheckpoints,
          openCheckpointEditor,
          startCheckpoints, stopCheckpoints } from './checkpoints.js';
@@ -321,19 +321,24 @@ async function pickTrack() {
     await previewTrack();
 }
 
-// The previews: the track's colours (col.pcx, whose palette the car's
-// texture is shown in too), the car turning, its texture.
-let trackPalette = null, carShown = null, textureShown = null;
+// The previews: the track in 3D (map.pcx's heights under col.pcx's colours,
+// whose palette the car's texture is shown in too; col.pcx flat without
+// WebGL 2), turning, the car turning, its texture.
+let trackPalette = null, trackShown = null, carShown = null, textureShown = null;
 
 async function previewTrack() {
-    const col = fileNamed(track.files, 'col.pcx'), shown = track;
+    const col = fileNamed(track.files, 'col.pcx'), map = fileNamed(track.files, 'map.pcx'), shown = track;
     const image = col && decodePcx(wasm, await col.read());
+    const heights = map && decodePcx(wasm, await map.read());
     if (track !== shown)
         return;
-    $('trackPreview').hidden = !image;
+    const canvas = $('trackPreview');
+    canvas.hidden = !image;
     trackPalette = image?.palette;
-    if (image)
-        drawPcx($('trackPreview'), image, image.palette, 256, 256);   // the map's colours, as the game crops them
+    trackShown = image && heights ? { heights, image } : null;
+    canvas.width = canvas.height = 384;                 // drawPcx's 256 x 256 undone
+    if (image && !(trackShown && drawTrack(canvas, heights, image, 0)))
+        drawPcx(canvas, image, image.palette, 256, 256);  // the map's colours, as the game crops them
     if (textureShown)
         drawPcx($('texturePreview'), textureShown, trackPalette || textureShown.palette);
 }
@@ -365,6 +370,8 @@ function spinCar(now) {
         const texture = textureShown || defaultTexture;
         drawCar($('carPreview'), carShown, now / 2000, texture, trackPalette || texture?.palette);
     }
+    if (trackShown && !playing && !$('anniversary').hidden)
+        drawTrack($('trackPreview'), trackShown.heights, trackShown.image, now / 6000);
     requestAnimationFrame(spinCar);
 }
 requestAnimationFrame(spinCar);

@@ -139,8 +139,66 @@ export function wheelTriangles(wheel, radius) {
     return tris;
 }
 
-// The car's WebGL 2 drawing on a canvas: its program, and the triangles and
-// texture of the car, texture and palette it was last given.
+// One WebGL 2 context, on a canvas of its own that is not shown, draws the
+// previews (the car's and the map's), each then copied onto its 2D canvas:
+// a page has only so many contexts, and the game wants its own.
+let shared;
+
+function glShared() {
+    if (shared !== undefined)
+        return shared;
+    const canvas = document.createElement('canvas'), gl = canvas.getContext('webgl2');
+    return shared = gl ? { canvas, gl } : null;
+}
+
+function glProgram(gl, vertex, fragment) {
+    const program = gl.createProgram();
+    for (const [type, source] of [[gl.VERTEX_SHADER, vertex], [gl.FRAGMENT_SHADER, fragment]]) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+            console.error(gl.getShaderInfoLog(shader));
+        gl.attachShader(program, shader);
+    }
+    gl.linkProgram(program);
+    return program;
+}
+
+function glTexture(gl) {
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER])
+        gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST);
+    for (const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T])
+        gl.texParameteri(gl.TEXTURE_2D, p, gl.CLAMP_TO_EDGE);
+    return texture;
+}
+
+// Starts a drawing the size of the canvas (at the bottom left of the shared
+// one, which only grows), cleared.
+function glBegin(canvas) {
+    const { gl } = shared;
+    if (shared.canvas.width < canvas.width || shared.canvas.height < canvas.height) {
+        shared.canvas.width = Math.max(shared.canvas.width, canvas.width);
+        shared.canvas.height = Math.max(shared.canvas.height, canvas.height);
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+}
+
+// Copies the drawing onto the canvas (in the same task as it was drawn,
+// before the browser drops it).
+function glPresent(canvas) {
+    const ctx = canvas.getContext('2d'), { width, height } = canvas;
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(shared.canvas, 0, shared.canvas.height - height, width, height, 0, 0, width, height);
+}
+
+// The car's drawing: its program, and the triangles and texture of the
+// car, texture and palette it was last given.
 const VERTEX_SHADER = `#version 300 es
 in vec3 pos; in vec2 uv; in vec3 rgb;
 uniform vec3 mid; uniform float angle, scale, aspect;
@@ -161,34 +219,21 @@ void main() {
     colour = vUv.x < 0.0 ? vec4(vRgb, 1.0) : texture(tex, vUv / texSize);
 }`;
 
-function carView(canvas) {
-    if (canvas.carView)
-        return canvas.carView;
-    const gl = canvas.getContext('webgl2');
-    if (!gl)
+function carView() {
+    if (!glShared())
         return null;
-    const program = gl.createProgram();
-    for (const [type, source] of [[gl.VERTEX_SHADER, VERTEX_SHADER], [gl.FRAGMENT_SHADER, FRAGMENT_SHADER]]) {
-        const shader = gl.createShader(type);
-        gl.shaderSource(shader, source);
-        gl.compileShader(shader);
-        gl.attachShader(program, shader);
-    }
-    gl.linkProgram(program);
-    const view = { gl, program, buffer: gl.createBuffer(), texture: gl.createTexture(), count: 0, given: [] };
-    gl.bindVertexArray(gl.createVertexArray());
+    if (shared.car)
+        return shared.car;
+    const { gl } = shared, program = glProgram(gl, VERTEX_SHADER, FRAGMENT_SHADER);
+    const view = { gl, program, vao: gl.createVertexArray(), buffer: gl.createBuffer(), texture: glTexture(gl), count: 0, given: [] };
+    gl.bindVertexArray(view.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, view.buffer);
     for (const [name, size, offset] of [['pos', 3, 0], ['uv', 2, 12], ['rgb', 3, 20]]) {
         const at = gl.getAttribLocation(program, name);
         gl.enableVertexAttribArray(at);
         gl.vertexAttribPointer(at, size, gl.FLOAT, false, 32, offset);
     }
-    gl.bindTexture(gl.TEXTURE_2D, view.texture);
-    for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER])
-        gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST);
-    for (const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T])
-        gl.texParameteri(gl.TEXTURE_2D, p, gl.CLAMP_TO_EDGE);
-    return canvas.carView = view;
+    return shared.car = view;
 }
 
 // The car's triangles (8 floats a corner: x, y, z, u, v, r, g, b; u < 0 for
@@ -215,6 +260,7 @@ function upload(view, car, texture, palette) {
     const w = texture?.width || 1, h = texture?.height || 1, rgba = new Uint8Array(w * h * 4).fill(128);
     if (texture)
         texture.pixels.forEach((c, i) => rgba.set([...colour(c), 255], i * 4));
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, view.texture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
     view.texSize = [w, h];
@@ -227,7 +273,7 @@ function upload(view, car, texture, palette) {
 // Draws the car turned by angle (radians, around z), seen from a little
 // above, with its texture (an image of decodePcx) in a palette, with WebGL.
 export function drawCar(canvas, car, angle, texture, palette) {
-    const view = carView(canvas);
+    const view = carView();
     if (!view || !car.points.length)
         return;
     const { gl } = view;
@@ -235,12 +281,12 @@ export function drawCar(canvas, car, angle, texture, palette) {
         upload(view, car, texture, palette);
         view.given = [car, texture, palette];
     }
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.enable(gl.DEPTH_TEST);
+    glBegin(canvas);
     gl.cullFace(gl.BACK);
     gl.useProgram(view.program);
+    gl.bindVertexArray(view.vao);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, view.texture);
     const u = (name) => gl.getUniformLocation(view.program, name);
     gl.uniform3fv(u('mid'), view.mid);
     gl.uniform1f(u('angle'), angle);
@@ -251,4 +297,155 @@ export function drawCar(canvas, car, angle, texture, palette) {
     gl.drawArrays(gl.TRIANGLES, 0, view.body);
     gl.disable(gl.CULL_FACE);           // the wheels whichever way they turn
     gl.drawArrays(gl.TRIANGLES, view.body, view.count - view.body);
+    glPresent(canvas);
 }
+
+// The map in 3D by relief (parallax) mapping: a box around the ground (from
+// its lowest to its highest), each point of it following the ray from the
+// eye into the box until under the ground (map.pcx, a height a byte,
+// filtered), coloured there (col.pcx) and lit by the slope; its sides the
+// ground's edges.  As in the game, both are the top left 256 x 256 of their
+// images, and a height of 255 is 255 * 16 map units over cells of 256.
+const TRACK_VERTEX_SHADER = `#version 300 es
+uniform float angle, scale, aspect, tilt, top, distance, low, high;
+out vec3 vPos;
+const int FACES[36] = int[36](0,1,3, 0,3,2, 4,6,7, 4,7,5, 0,4,5, 0,5,1, 2,3,7, 2,7,6, 0,2,6, 0,6,4, 1,5,7, 1,7,3);
+void main() {
+    int k = FACES[gl_VertexID];
+    vec3 p = vec3(float(k & 1) - 0.5, float(k >> 1 & 1) - 0.5, ((k & 4) != 0 ? high : low) / 256.0);
+    p.z = (p.z - 0.3) * top;
+    float c = cos(angle), s = sin(angle), ce = cos(tilt), se = sin(tilt);
+    float rx = p.x * c - p.y * s, ry = p.x * s + p.y * c;
+    float depth = ry * ce - p.z * se, w = 1.0 + depth / distance;
+    gl_Position = vec4(rx * scale / aspect, (p.z * ce + ry * se) * scale, depth * scale * 0.5 * w, w);
+    vPos = p;
+}`;
+const TRACK_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+in vec3 vPos;
+uniform sampler2D ground; uniform sampler2D colours;
+uniform float top, low, high; uniform vec3 eye;
+out vec4 colour;
+float z(vec2 p) { return (texture(ground, vec2(p.x + 0.5, 0.5 - p.y)).r * 255.0 / 256.0 - 0.3) * top; }
+void main() {
+    vec3 d = normalize(vPos - eye);
+    // where the ray enters and leaves the box
+    vec3 lo = vec3(-0.5, -0.5, (low / 256.0 - 0.3) * top - 1e-4), hi = vec3(0.5, 0.5, (high / 256.0 - 0.3) * top + 1e-4);
+    vec3 t0 = (lo - eye) / d, t1 = (hi - eye) / d;
+    float enter = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    float leave = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    if (enter > leave)
+        discard;
+    // steps of half a cell across the ground, then halved down to the crossing
+    float span = leave - enter, steps = clamp(ceil(length(d.xy) * span * 512.0), 1.0, 768.0), dt = span / steps;
+    float t = enter;
+    bool hit = false;
+    for (float i = 0.0; i <= steps; i++, t += dt) {
+        vec3 p = eye + d * min(t, leave);
+        if (p.z <= z(p.xy)) { hit = true; break; }
+    }
+    if (!hit)
+        discard;
+    float a = max(t - dt, enter), b = min(t, leave);
+    for (int i = 0; i < 6; i++) {
+        float m = (a + b) * 0.5;
+        vec3 p = eye + d * m;
+        if (p.z <= z(p.xy)) b = m; else a = m;
+    }
+    vec3 p = eye + d * b;
+    vec2 e = vec2(1.0 / 256.0, 0.0);
+    vec2 slope = vec2(z(p.xy + e.xy) - z(p.xy - e.xy), z(p.xy + e.yx) - z(p.xy - e.yx)) * 128.0;
+    vec3 n = normalize(vec3(-slope, 1.0));
+    float light = 0.5 + 0.5 * max(dot(n, normalize(vec3(-0.6, 0.6, 1.0))), 0.0);
+    ivec2 at = clamp(ivec2(vec2(p.x + 0.5, 0.5 - p.y) * 256.0), ivec2(0), ivec2(255));
+    colour = vec4(texelFetch(colours, at, 0).rgb * light, 1.0);
+}`;
+
+function trackView() {
+    if (!glShared())
+        return null;
+    if (shared.track)
+        return shared.track;
+    const { gl } = shared;
+    const view = { program: glProgram(gl, TRACK_VERTEX_SHADER, TRACK_FRAGMENT_SHADER),
+        box: gl.createVertexArray(),            // no attributes: the corners from gl_VertexID
+        ground: glTexture(gl), colours: glTexture(gl), given: [] };
+    gl.bindTexture(gl.TEXTURE_2D, view.ground);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    return shared.track = view;
+}
+
+function crop256(image) {
+    const out = new Uint8Array(256 * 256);
+    for (let y = 0; y < Math.min(256, image.height); y++)
+        out.set(image.pixels.subarray(y * image.width, y * image.width + Math.min(256, image.width)), y * 256);
+    return out;
+}
+
+// Draws the map (images of decodePcx: its heights, map.pcx, and its colours,
+// col.pcx, in their palette) turned by angle (radians), seen from above at
+// tilt (radians over the horizon), with WebGL; false without WebGL 2.
+
+// Draws the map (images of decodePcx: its heights, map.pcx, and its colours,
+// col.pcx, in their palette) turned by angle (radians), seen from above at
+// tilt (radians over the horizon), in perspective, with WebGL; false
+// without WebGL 2.
+export function drawTrack(canvas, heights, colours, angle, tilt = 0.6) {
+    const view = trackView();
+    if (!view)
+        return false;
+    const { gl } = shared;
+    if (view.given[0] !== heights || view.given[1] !== colours) {
+        const ground = crop256(heights);
+        view.low = ground.reduce((a, b) => Math.min(a, b), 255);
+        view.high = ground.reduce((a, b) => Math.max(a, b), 0);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, view.ground);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 256, 256, 0, gl.RED, gl.UNSIGNED_BYTE, ground);
+        const index = crop256(colours), palette = colours.palette, rgba = new Uint8Array(256 * 256 * 4);
+        index.forEach((c, i) => rgba.set(palette ? [palette[c * 3], palette[c * 3 + 1], palette[c * 3 + 2], 255] : [c, c, c, 255], i * 4));
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, view.colours);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+        gl.activeTexture(gl.TEXTURE0);
+        view.given = [heights, colours];
+    }
+    glBegin(canvas);
+    gl.disable(gl.DEPTH_TEST);          // every face of the box draws the same
+    gl.disable(gl.CULL_FACE);
+    gl.useProgram(view.program);
+    gl.bindVertexArray(view.box);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, view.ground);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, view.colours);
+    gl.activeTexture(gl.TEXTURE0);
+    const u = (name) => gl.getUniformLocation(view.program, name);
+    gl.uniform1i(u('ground'), 1);
+    gl.uniform1i(u('colours'), 2);
+    gl.uniform1f(u('angle'), angle);
+    gl.uniform1f(u('tilt'), tilt);
+    gl.uniform1f(u('top'), 256 * 16 / (256 * 256) * TRACK_RELIEF);
+    gl.uniform1f(u('low'), view.low);
+    gl.uniform1f(u('high'), view.high);
+    gl.uniform1f(u('scale'), 1.35 * 1.25);
+    gl.uniform1f(u('distance'), TRACK_EYE);
+    gl.uniform1f(u('aspect'), canvas.width / canvas.height);
+    // the eye in the map: the drawing's (0, 0, -distance) turned back
+    const ce = Math.cos(tilt), se = Math.sin(tilt), c = Math.cos(angle), s = Math.sin(angle);
+    const ry = -TRACK_EYE * ce;
+    gl.uniform3f(u('eye'), ry * s, ry * c, TRACK_EYE * se);
+    gl.drawArrays(gl.TRIANGLES, 0, 36);
+    gl.enable(gl.DEPTH_TEST);
+    glPresent(canvas);
+    return true;
+}
+
+// How far the eye is from the middle of the map (in maps).
+const TRACK_EYE = 2.5;
+
+// How much higher than in the game the ground is drawn, to be seen.
+const TRACK_RELIEF = 2;
+
