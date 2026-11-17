@@ -8,18 +8,29 @@
   :root { color-scheme: dark; }
   [hidden] { display: none !important; }  /* #game's display: flex would show it anyway */
   body { margin: 0; background: #111; color: #ddd; font: 15px/1.4 system-ui, sans-serif; }
-  #chooser { max-width: 40em; margin: 2em auto; padding: 0 16px; }
+  #chooser { max-width: 60em; margin: 2em auto; padding: 0 16px; }
   h1 { font-size: 1.4em; }
-  #maps button { display: block; margin: 4px 0; padding: 6px 12px; font: inherit; cursor: pointer; }
   #chooser.loading button { opacity: 0.5; cursor: progress; }
-  #maps button:disabled, #playZip:disabled, #playZipCheckpoints:disabled { opacity: 0.5; cursor: default; }
+  #playZip:disabled, #playZipCheckpoints:disabled { opacity: 0.5; cursor: default; }
   .missing { margin: 0 0 8px 12px; color: #e9a; }
   #previews { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; margin: 8px 0; }
-  #previews canvas { max-width: 192px; height: auto; image-rendering: pixelated; background: #000; }
+  /* the previews share the width (one under the other on a phone), drawn at their size (terep2.js) */
+  #previews canvas { flex: 1 1 18em; min-width: 0; max-width: 40em; height: auto; image-rendering: pixelated; background: #000; }
   #previews #trackPreview { image-rendering: auto; }   /* in 3D, smoothed */
   #playZip, #playZipCheckpoints { padding: 6px 18px; font: inherit; cursor: pointer; }
   .small { color: #999; font-size: 0.9em; }
   .options label { display: block; margin: 4px 0; }   /* one option a line */
+  /* the map, car and texture: names in a column, their lists in the next */
+  .picks { display: grid; grid-template-columns: max-content minmax(0, 24em); gap: 4px 8px; align-items: center; }
+  .options .picks label { display: contents; }
+  #previews canvas:not(#texturePreview) { cursor: grab; }
+  /* the renderer, as two tabs, each with its own options */
+  .tabs { display: flex; margin-top: 1em; border-bottom: 1px solid #444; }
+  .tabs button { margin-bottom: -1px; padding: 6px 16px; font: inherit; color: #999; cursor: pointer;
+    background: none; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; }
+  .tabs button[aria-selected="true"] { color: #ddd; background: #1a1a1a; border-color: #444; }
+  .tabpanel { margin: 0 0 1em; padding: 4px 12px; background: #1a1a1a; border: 1px solid #444; border-top: none;
+    border-radius: 0 0 6px 6px; }
   #game { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; }
   #screen { image-rendering: pixelated; }
   #gl, #overlay { position: fixed; inset: 0; width: 100vw; height: 100vh; }
@@ -57,62 +68,52 @@
 <body>
 <div id="chooser">
   <h1>Terep2 Web</h1>
-  <p class="options"><label>Load from <select id="source">
-    <option value="zip">The Terep2 30th Anniversary Edition zip</option>
-    <option value="folder">A map folder</option>
-  </select></label></p>
-  <div id="fromZip">
+  <p>A zip: the Terep2 30th Anniversary Edition, a megapack or a map.</p>
+  <p class="small">The zip can also be dropped on this page.
+  The files are read here, in the browser: nothing is uploaded.</p>
   <p><input type="file" id="zip" accept=".zip"></p>
   <div id="anniversary" class="options" hidden>
-    <label>Map <select id="track"></select></label>
-    <label>Car <select id="carModel"></select></label>
-    <label>Car texture <select id="carTexture"></select></label>
+    <p id="zipMap" hidden></p>
+    <div class="picks">
+      <label>Map <select id="track"></select></label>
+      <label>Car <select id="carModel"></select></label>
+      <label>Car texture <select id="carTexture"></select></label>
+    </div>
     <div id="previews">
-      <canvas id="trackPreview" width="384" height="384" title="The map (col.pcx over the heights of map.pcx)" hidden></canvas>
-      <canvas id="carPreview" width="256" height="192" title="The car"></canvas>
+      <canvas id="trackPreview" width="384" height="256" title="The map (col.pcx over the heights of map.pcx)" hidden></canvas>
+      <canvas id="carPreview" width="384" height="256" title="The car"></canvas>
       <canvas id="texturePreview" title="The car's texture" hidden></canvas>
     </div>
+  </div>
+  <div id="playArea" hidden>   <!-- once a zip is open: the options, the buttons -->
+    <div class="tabs" role="tablist">
+      <button role="tab" data-renderer="webgl">WebGL</button>
+      <button role="tab" data-renderer="software">Software (the original)</button>
+    </div>
+    <select id="renderer" hidden><option value="webgl"></option><option value="software"></option></select>
+    <div class="tabpanel options" role="tabpanel">
+      <label class="gl-only">Quality <select id="quality">
+        <option value="high">High</option>
+        <option value="medium">Medium (one shadow map, 3/4 resolution)</option>
+        <option value="low">Low (short, coarse shadows, half resolution)</option>
+      </select></label>
+      <label class="gl-only"><input type="checkbox" id="frameskip"> Frameskip (half framerate for very weak phones)</label>
+      <label class="gl-only">Draw distance <input type="range" id="distance" min="8" max="100" value="35">
+        <span id="distanceText"></span></label>
+      <label class="sw-only">Render scale <select id="scale">
+        <option value="1">1x (the original)</option><option value="2">2x</option>
+        <option value="3" selected>3x</option><option value="4">4x</option>
+      </select></label>
+    </div>
+    <p class="options">
+      <label><input type="checkbox" id="fixice" checked> fix-ice-bug</label>
+      <label><input type="checkbox" id="banner"> hide-banner</label>
+      <label><input type="checkbox" id="sound" checked> Sound</label>
+      <label><input type="checkbox" id="minimapOn"> Minimap</label>
+    </p>
     <p id="trackMissing" class="small missing"></p>
     <button id="playZip">Play</button> <button id="playZipCheckpoints" hidden>Play with checkpoints</button>
   </div>
-  </div>
-  <div id="fromFolder" hidden>
-  <p>A folder with maps (a map is a folder with <code>map.pcx</code>, <code>col.pcx</code> and
-  <code>car1.dat</code>).</p>
-  <p><input type="file" id="folder" webkitdirectory multiple></p>
-  <div id="maps"></div>
-  <p id="none" class="small" hidden>No map found there.</p>
-  </div>
-  <p class="small">The zip or the folders can also be dropped on this page.
-  The files are read here, in the browser: nothing is uploaded.</p>
-  <p class="options">
-    <label>Renderer <select id="renderer">
-      <option value="webgl">WebGL</option>
-      <option value="software">Software (the original)</option>
-    </select></label>
-  </p>
-  <p class="options">
-    <label class="gl-only">Quality <select id="quality">
-      <option value="high">High</option>
-      <option value="medium">Medium (one shadow map, 3/4 resolution)</option>
-      <option value="low">Low (short, coarse shadows, half resolution)</option>
-    </select></label>
-    <label class="gl-only"><input type="checkbox" id="frameskip"> Frameskip (half framerate for very weak phones)</label>
-    <label class="gl-only">Draw distance <input type="range" id="distance" min="8" max="100" value="35">
-      <span id="distanceText"></span></label>
-  </p>
-  <p class="options">
-    <label class="sw-only">Render scale <select id="scale">
-      <option value="1">1x (the original)</option><option value="2">2x</option>
-      <option value="3" selected>3x</option><option value="4">4x</option>
-    </select></label>
-  </p>
-  <p class="options">
-    <label><input type="checkbox" id="fixice" checked> fix-ice-bug</label>
-    <label><input type="checkbox" id="banner"> hide-banner</label>
-    <label><input type="checkbox" id="sound" checked> Sound</label>
-    <label><input type="checkbox" id="minimapOn"> Minimap</label>
-  </p>
   <p id="status" class="small"></p>
   <p class="small">Keys: arrows + keypad 5 drive car 1 (W Z A D S car 2...), 1 / 2 jump, F1–F5 cameras,
   F6 second view's camera (with WebGL: a free camera, W A S D, E / Space, Q, the mouse after a click), F9 split screen, F10 fog, Tab / Q change car, [ ] gravity.

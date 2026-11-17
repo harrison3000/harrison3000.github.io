@@ -201,13 +201,15 @@ function glPresent(canvas) {
 // car, texture and palette it was last given.
 const VERTEX_SHADER = `#version 300 es
 in vec3 pos; in vec2 uv; in vec3 rgb;
-uniform vec3 mid; uniform float angle, scale, aspect;
+uniform vec3 mid; uniform float angle, tilt, scale, aspect;
 out vec2 vUv; out vec3 vRgb;
 void main() {
     vec3 p = pos - mid;
-    float c = cos(angle), s = sin(angle), ce = cos(0.45), se = sin(0.45);
+    float c = cos(angle), s = sin(angle), ce = cos(tilt), se = sin(tilt);
     float rx = p.x * c - p.y * s, ry = p.x * s + p.y * c;
-    gl_Position = vec4(rx * scale / aspect, (p.z * ce + ry * se) * scale, (ry * ce - p.z * se) * scale * 0.5, 1.0);
+    // in perspective, as the map's: the eye 5 times the car's size away
+    float depth = (ry * ce - p.z * se) * scale, w = 1.0 + depth / 4.5;
+    gl_Position = vec4(rx * scale / aspect, (p.z * ce + ry * se) * scale, depth * 0.5 * w, w);
     vUv = uv; vRgb = rgb;
 }`;
 const FRAGMENT_SHADER = `#version 300 es
@@ -270,9 +272,9 @@ function upload(view, car, texture, palette) {
     view.size = Math.max(...car.points.map((p) => Math.hypot(p.x - view.mid[0], p.y - view.mid[1], p.z - view.mid[2]) + p.radius));
 }
 
-// Draws the car turned by angle (radians, around z), seen from a little
-// above, with its texture (an image of decodePcx) in a palette, with WebGL.
-export function drawCar(canvas, car, angle, texture, palette) {
+// Draws the car turned by angle (radians, around z), seen from tilt
+// (radians over the horizon) zoomed by zoom, with its texture (an image of decodePcx) in a palette, with WebGL.
+export function drawCar(canvas, car, angle, texture, palette, tilt = 0.45, zoom = 1) {
     const view = carView();
     if (!view || !car.points.length)
         return;
@@ -290,7 +292,8 @@ export function drawCar(canvas, car, angle, texture, palette) {
     const u = (name) => gl.getUniformLocation(view.program, name);
     gl.uniform3fv(u('mid'), view.mid);
     gl.uniform1f(u('angle'), angle);
-    gl.uniform1f(u('scale'), 0.9 / view.size);
+    gl.uniform1f(u('scale'), 0.9 * zoom / view.size);
+    gl.uniform1f(u('tilt'), tilt);
     gl.uniform1f(u('aspect'), canvas.width / canvas.height);
     gl.uniform2fv(u('texSize'), view.texSize);
     gl.enable(gl.CULL_FACE);            // the body without the back of its polygons, as the game
@@ -389,9 +392,9 @@ function crop256(image) {
 
 // Draws the map (images of decodePcx: its heights, map.pcx, and its colours,
 // col.pcx, in their palette) turned by angle (radians), seen from above at
-// tilt (radians over the horizon), in perspective, with WebGL; false
+// tilt (radians over the horizon), in perspective, zoomed by zoom, with WebGL; false
 // without WebGL 2.
-export function drawTrack(canvas, heights, colours, angle, tilt = 0.6) {
+export function drawTrack(canvas, heights, colours, angle, tilt = 0.6, zoom = 1) {
     const view = trackView();
     if (!view)
         return false;
@@ -430,7 +433,7 @@ export function drawTrack(canvas, heights, colours, angle, tilt = 0.6) {
     gl.uniform1f(u('top'), 256 * 16 / (256 * 256) * TRACK_RELIEF);
     gl.uniform1f(u('low'), view.low);
     gl.uniform1f(u('high'), view.high);
-    gl.uniform1f(u('scale'), 1.35 * 1.25);
+    gl.uniform1f(u('scale'), 2 * zoom);
     gl.uniform1f(u('distance'), TRACK_EYE);
     gl.uniform1f(u('aspect'), canvas.width / canvas.height);
     // the eye in the map: the drawing's (0, 0, -distance) turned back

@@ -1,8 +1,8 @@
-// The web host's page side, an ES module (see host_web/web_main.cpp): picks a map folder (read
+// The web host's page side, an ES module (see host_web/web_main.cpp): picks a map from a zip (read
 // locally, nothing is uploaded), runs the game in terep2.wasm and draws it: the game's own
 // picture on a 2D canvas, or the OpenGL renderer's with WebGL 2 (webgl.js) and its text over it.
 import { webglImports } from './webgl.js';
-import { baseName, openAnniversary, trackFiles, trackTitle } from './anniversary.js';
+import { baseName, checkpointsOf, MAP_FILE, NEEDED, openZip as readGameZip, trackFiles, WANTED } from './anniversary.js';
 import { decodeCar, decodePcx, drawCar, drawPcx, drawTrack } from './preview.js';
 import { checkpointsAfterFrame, checkpointsBeforeFrame, checkpointsKey, checkpointsMinimap, checkpointsOverlay, checkpointsOverlayOn, editingCheckpoints,
          openCheckpointEditor,
@@ -161,8 +161,6 @@ function drawMinimap() {
 }
 
 let wasm = null;                    // the module's exports
-let maps = new Map();               // folder path -> its files ({ path, read })
-let mapTitles = new Map();          // folder path -> its name (inst.inf's, else the path)
 let playing = false, last = 0;
 let webgl = false;                  // this game is drawn by the OpenGL renderer
 let quality = 'high';               // ...in this quality (QUALITIES)
@@ -178,58 +176,9 @@ async function load() {
     wasm = instance.exports;
 }
 
-// The folders of the picked one that hold a map (any of its files, the
-// missing ones shown), with their files: only the kinds of file the game
-// reads (PCX images, .dat tables and cars, sim.cfg); anything else in the
-// folders is never read.  A file is { path, read }: read() gives its
-// contents, an ArrayBuffer.
-const MAP_FILE = /\.(pcx|dat|cfg)$/i;
-const NEEDED = ['map.pcx', 'col.pcx', 'maptex.pcx'];         // without one of them, no map (load_map)
-const WANTED = ['textures.pcx', 'fog.dat', 'smoke.dat'];     // without them it plays, looking wrong
+// A map's files missing (anniversary.js's NEEDED and WANTED) are shown.
 const GL_ONLY = ['fog.dat', 'smoke.dat'];   // the software renderer's tables: without them, only OpenGL
 const fileNamed = (files, name) => files.find((f) => baseName(f.path).toLowerCase() === name);
-
-function findMaps(files) {
-    const dirs = new Map();
-    for (const f of files) {
-        if (!MAP_FILE.test(f.path))
-            continue;
-        const dir = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '.';
-        if (!dirs.has(dir))
-            dirs.set(dir, []);
-        dirs.get(dir).push(f);
-    }
-    const found = new Map();
-    for (const [dir, files] of dirs) {
-        const names = new Set(files.map((f) => baseName(f.path).toLowerCase()));
-        if ([...NEEDED, ...WANTED].some((n) => names.has(n)))
-            found.set(dir, files);
-    }
-    return found;
-}
-
-const fromFile = (f, path) => ({ path: path || f.webkitRelativePath || f.name, read: () => f.arrayBuffer() });
-
-// The files of what is dropped on the page: files, folders (walked).
-async function droppedFiles(items) {
-    const files = [];
-    async function walk(entry) {
-        if (entry.isFile) {
-            const f = await new Promise((ok, fail) => entry.file(ok, fail));
-            files.push(fromFile(f, entry.fullPath.slice(1)));
-        } else if (entry.isDirectory) {
-            const reader = entry.createReader();
-            for (let batch; (batch = await new Promise((ok, fail) => reader.readEntries(ok, fail))).length;)
-                for (const e of batch)
-                    await walk(e);
-        }
-    }
-    // the entries before anything is awaited: the items are gone after the drop event
-    const entries = [...items].map((i) => i.webkitGetAsEntry?.() || i.getAsFile());
-    for (const entry of entries.filter(Boolean))
-        await (entry instanceof File ? files.push(fromFile(entry)) : walk(entry));
-    return files;
-}
 
 // What is missing from a map's files ([name, file]), and whether it can be
 // played with the renderer chosen.
@@ -241,45 +190,16 @@ function checkMap(files) {
     return { playable, text: missing.length ? 'Missing: ' + missing.join(', ') + (glOnly ? ' (plays with WebGL only)' : '') : '' };
 }
 
-// A folder's map, as the game opens its files: by their names.
-const folderMap = (dir) => maps.get(dir).map((f) => [baseName(f.path), f]);
-
-function showMaps() {
-    const list = $('maps');
-    list.innerHTML = '';
-    for (const dir of [...maps.keys()].sort((a, b) => mapTitles.get(a).localeCompare(mapTitles.get(b)))) {
-        const { playable, text } = checkMap(folderMap(dir));
-        const b = document.createElement('button');
-        b.textContent = mapTitles.get(dir);
-        b.title = dir;
-        b.disabled = !playable;
-        b.onclick = () => play(folderMap(dir), baseName(dir));
-        list.appendChild(b);
-        if (hasCheckpoints(baseName(dir))) {
-            const c = document.createElement('button');
-            checkpointsButton(c, playable);
-            c.onclick = () => play(folderMap(dir), baseName(dir), true);
-            list.appendChild(c);
-        }
-        if (text) {
-            const p = document.createElement('div');
-            p.className = 'small missing';
-            p.textContent = text;
-            list.appendChild(p);
-        }
-    }
-    $('none').hidden = maps.size > 0;
-}
-
-// The 30th Anniversary Edition's zip (anniversary.js): a track, a car and its
-// texture picked from it.  One car for now: car1.dat, car1.pcx.
-let anniversary = null;             // what openAnniversary gave
+// The zip (anniversary.js): the 30th Anniversary Edition's (a track, a car
+// and its texture picked from it; one car for now: car1.dat, car1.pcx), a
+// megapack's (a track picked, with its own car) or a map's (only played).
+let zipped = null;                  // what openZip gave
 let track = null;                   // the track picked: { choice, files }
 
 function fillSelect(select, choices, none) {
     select.innerHTML = none ? `<option value="-1">${none}</option>` : '';
     for (const [k, c] of choices.entries()) {
-        let group = [...select.children].find((g) => g.label === c.group);
+        let group = c.group ? [...select.children].find((g) => g.label === c.group) : select;
         if (!group) {
             group = document.createElement('optgroup');
             group.label = c.group;
@@ -290,31 +210,43 @@ function fillSelect(select, choices, none) {
 }
 
 async function openZip(file) {
-    $('anniversary').hidden = true;
-    anniversary = await openAnniversary(file);
-    if (!anniversary.tracks.length || !anniversary.cars.length)
-        throw new Error('no map or no car in it: is it the 30th Anniversary Edition zip?');
+    $('anniversary').hidden = $('playArea').hidden = true;
+    zipped = null;
+    carShown = textureShown = defaultTexture = trackShown = null;
+    const opened = await readGameZip(file);
     const withCheckpoints = await checkpointFiles;
-    for (const t of anniversary.tracks)
-        if (withCheckpoints.has(zipTrackName(t).toLowerCase()))
+    for (const t of opened.tracks)
+        if (checkpointsOf(t.files) || withCheckpoints.has(zipTrackName(t).toLowerCase()))
             t.title += CHECKPOINTS_MARK;
-    fillSelect($('track'), anniversary.tracks);
-    fillSelect($('carModel'), anniversary.cars);
-    fillSelect($('carTexture'), anniversary.textures, 'None (textures.pcx)');
-    const textures = fileNamed(anniversary.shared, 'textures.pcx');
-    defaultTexture = textures && decodePcx(wasm, await textures.read());
-    $('carModel').onchange();
-    $('anniversary').hidden = false;
+    zipped = opened;
+    // what is picked: the track but in a map's zip, the car in the Anniversary Edition's
+    const anniversary = zipped.kind === 'anniversary', map = zipped.kind === 'map';
+    $('track').parentElement.hidden = map;
+    for (const id of ['carModel', 'carTexture'])
+        $(id).parentElement.hidden = !anniversary;
+    $('carPreview').hidden = !anniversary;
+    $('texturePreview').hidden = true;
+    $('zipMap').hidden = !map;
+    $('zipMap').textContent = map ? 'Map: ' + zipped.tracks[0].title : '';
+    fillSelect($('track'), zipped.tracks);
+    fillSelect($('carModel'), zipped.cars);
+    fillSelect($('carTexture'), zipped.textures, 'None (textures.pcx)');
+    if (anniversary) {
+        const textures = fileNamed(zipped.shared, 'textures.pcx');
+        defaultTexture = textures && decodePcx(wasm, await textures.read());
+        $('carModel').onchange();
+    }
+    $('anniversary').hidden = $('playArea').hidden = false;
     await pickTrack();
 }
 
 // The track's files, read when it is picked (its zip is in the zip).
 async function pickTrack() {
-    const choice = anniversary.tracks[+$('track').value];
+    const choice = zipped.tracks[+$('track').value];
     track = null;
     showTrack();
     const files = await trackFiles(choice);
-    if (anniversary.tracks[+$('track').value] !== choice)      // another picked meanwhile
+    if (zipped.tracks[+$('track').value] !== choice)      // another picked meanwhile
         return;
     track = { choice, files };
     showTrack();
@@ -336,24 +268,26 @@ async function previewTrack() {
     canvas.hidden = !image;
     trackPalette = image?.palette;
     trackShown = image && heights ? { heights, image } : null;
-    canvas.width = canvas.height = 384;                 // drawPcx's 256 x 256 undone
-    if (image && !(trackShown && drawTrack(canvas, heights, image, 0)))
+    fitCanvas(canvas, 2 / 3);                           // drawPcx's 256 x 256 undone too
+    if (image && !(trackShown && drawTrack(canvas, heights, image, trackView.angle, trackView.tilt, trackView.zoom))) {
+        trackShown = null;                              // no WebGL 2: flat
         drawPcx(canvas, image, image.palette, 256, 256);  // the map's colours, as the game crops them
+    }
     if (textureShown)
         drawPcx($('texturePreview'), textureShown, trackPalette || textureShown.palette);
 }
 
 async function previewCar() {
-    const choice = anniversary.cars[+$('carModel').value];
+    const choice = zipped.cars[+$('carModel').value];
     const car = decodeCar(await choice.file.read());
-    if (anniversary.cars[+$('carModel').value] === choice)
+    if (zipped.cars[+$('carModel').value] === choice)
         carShown = car;
 }
 
 async function previewTexture() {
-    const choice = anniversary.textures[+$('carTexture').value];
+    const choice = zipped.textures[+$('carTexture').value];
     const image = choice ? decodePcx(wasm, await choice.file.read()) : null;
-    if (anniversary.textures[+$('carTexture').value] !== choice)
+    if (zipped.textures[+$('carTexture').value] !== choice)
         return;
     textureShown = image;
     $('texturePreview').hidden = !image;
@@ -365,50 +299,141 @@ async function previewTexture() {
 // (the zip's), as in the game.
 let defaultTexture = null;
 
-function spinCar(now) {
-    if (carShown && !playing && !$('anniversary').hidden) {
-        const texture = textureShown || defaultTexture;
-        drawCar($('carPreview'), carShown, now / 2000, texture, trackPalette || texture?.palette);
+// A 3D preview's canvas the size it is shown at (the page's layout), in the
+// screen's pixels, height / width = aspect.
+function fitCanvas(canvas, aspect) {
+    const width = Math.round(canvas.clientWidth * devicePixelRatio), height = Math.round(width * aspect);
+    if (width > 0 && (canvas.width !== width || canvas.height !== height)) {
+        canvas.width = width;
+        canvas.height = height;
     }
-    if (trackShown && !playing && !$('anniversary').hidden)
-        drawTrack($('trackPreview'), trackShown.heights, trackShown.image, now / 6000);
+}
+
+// The previews' views, turned by hand: with the mouse dragged (sideways
+// turns it, up and down tilts it) and zoomed by Ctrl + the wheel (a
+// touchpad's pinch too); on a touch screen with two fingers, moved (turns,
+// tilts) and pinched (zooms), one finger scrolling the page as anywhere else.
+// Each spins on its own until touched; a double click (or tap) puts it back.
+function handView(canvas, tilt, tilts, speed) {
+    const view = { angle: 0, tilt, zoom: 1, spinning: true, speed };
+    const clamp = (x, [lo, hi]) => Math.min(hi, Math.max(lo, x));
+    const turn = (dx, dy) => {
+        view.angle += dx * 0.01;
+        view.tilt = clamp(view.tilt + dy * 0.005, tilts);
+        view.spinning = false;
+    };
+    const zoom = (by) => {
+        view.zoom = clamp(view.zoom * by, [0.5, 4]);
+        view.spinning = false;
+    };
+
+    let mouse = null;                   // where the mouse was, while dragging
+    canvas.addEventListener('pointerdown', (e) => {
+        if (e.pointerType === 'touch' || e.button !== 0)
+            return;
+        canvas.setPointerCapture(e.pointerId);
+        mouse = { x: e.clientX, y: e.clientY };
+    });
+    canvas.addEventListener('pointermove', (e) => {
+        if (!mouse || e.pointerType === 'touch')
+            return;
+        turn(e.clientX - mouse.x, e.clientY - mouse.y);
+        mouse = { x: e.clientX, y: e.clientY };
+    });
+    for (const type of ['pointerup', 'pointercancel'])
+        canvas.addEventListener(type, (e) => { if (e.pointerType !== 'touch') mouse = null; });
+    canvas.addEventListener('wheel', (e) => {
+        if (!e.ctrlKey)
+            return;                     // the page scrolls
+        e.preventDefault();
+        // a mouse wheel's notch (deltaY 100 or so, or in lines) 15%, a touchpad's pinch as it goes
+        const notch = e.deltaMode !== 0 || Math.abs(e.deltaY) >= 50;
+        zoom(Math.exp(-(notch ? Math.sign(e.deltaY) * 15 : e.deltaY) * 0.01));
+    }, { passive: false });
+
+    let fingers = null;                 // two fingers' middle and distance apart
+    const two = (e) => {
+        const [a, b] = e.touches;
+        return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2,
+            apart: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) };
+    };
+    canvas.addEventListener('touchstart', (e) => { fingers = e.touches.length === 2 ? two(e) : null; }, { passive: true });
+    canvas.addEventListener('touchmove', (e) => {
+        if (e.touches.length !== 2 || !fingers)
+            return;                     // one finger: the page scrolls
+        if (e.cancelable)
+            e.preventDefault();
+        const now = two(e);
+        turn(now.x - fingers.x, now.y - fingers.y);
+        if (fingers.apart > 0)
+            zoom(now.apart / fingers.apart);
+        fingers = now;
+    }, { passive: false });
+    for (const type of ['touchend', 'touchcancel'])
+        canvas.addEventListener(type, (e) => { fingers = e.touches.length === 2 ? two(e) : null; }, { passive: true });
+
+    canvas.addEventListener('dblclick', () => Object.assign(view, { angle: 0, tilt, zoom: 1, spinning: true }));
+    return view;
+}
+const carView = handView($('carPreview'), 0.45, [-0.8, 1.5], 1 / 2000);
+const trackView = handView($('trackPreview'), 0.6, [0.1, 1.5], 1 / 6000);
+let lastSpin = 0;
+
+function spinCar(now) {
+    for (const view of [carView, trackView])
+        if (view.spinning)
+            view.angle += (now - lastSpin) * view.speed;
+    lastSpin = now;
+    if (carShown && !playing && !$('anniversary').hidden && !$('carPreview').hidden) {
+        const texture = textureShown || defaultTexture;
+        fitCanvas($('carPreview'), 2 / 3);
+        drawCar($('carPreview'), carShown, carView.angle, texture, trackPalette || texture?.palette, carView.tilt, carView.zoom);
+    }
+    if (trackShown && !playing && !$('anniversary').hidden && !$('trackPreview').hidden) {
+        fitCanvas($('trackPreview'), 2 / 3);
+        drawTrack($('trackPreview'), trackShown.heights, trackShown.image, trackView.angle, trackView.tilt, trackView.zoom);
+    }
     requestAnimationFrame(spinCar);
 }
 requestAnimationFrame(spinCar);
 
-// The game's files: the track's, the shared ones it has not, the car.
-function anniversaryMap() {
+// The game's files: the track's, the shared ones it has not, the car
+// picked (the Anniversary Edition's; else the track's own).
+function zipMap() {
     const files = track.files.filter((f) => MAP_FILE.test(f.path)).map((f) => [baseName(f.path), f]);
-    for (const f of anniversary.shared)
+    for (const f of zipped.shared)
         if (!fileNamed(track.files, baseName(f.path).toLowerCase()))
             files.push([baseName(f.path), f]);
-    files.push(['car1.dat', anniversary.cars[+$('carModel').value].file]);
-    if (+$('carTexture').value >= 0)
-        files.push(['car1.pcx', anniversary.textures[+$('carTexture').value].file]);
+    if (zipped.kind === 'anniversary') {
+        files.push(['car1.dat', zipped.cars[+$('carModel').value].file]);
+        if (+$('carTexture').value >= 0)
+            files.push(['car1.pcx', zipped.textures[+$('carTexture').value].file]);
+    }
     return files;
 }
 
 function showTrack() {
-    const { playable, text } = track ? checkMap(anniversaryMap()) : { playable: false, text: 'Reading the map...' };
+    const { playable, text } = track ? checkMap(zipMap()) : { playable: false, text: 'Reading the map...' };
     $('playZip').disabled = !playable;
-    const choice = anniversary?.tracks[+$('track').value];
-    $('playZipCheckpoints').hidden = !choice || !hasCheckpoints(zipTrackName(choice));
+    const choice = zipped?.tracks[+$('track').value];
+    $('playZipCheckpoints').hidden = !choice || !(checkpointsOf(choice.files) || hasCheckpoints(zipTrackName(choice)));
     checkpointsButton($('playZipCheckpoints'), playable);
     $('trackMissing').textContent = text;
 }
 
 // Copies the map's files ([name, file]) into the module and starts the game
-// (name: the map's, for its checkpoints, played or not).  One at a time:
+// (name: the map's, for its checkpoints, played or not, from its own file
+// if it has one, else the page's).  One at a time:
 // while a map loads, more clicks do nothing.
 let loading = false;
 
-async function play(files, name, withCheckpoints = false) {
+async function play(files, name, withCheckpoints = false, ownCheckpoints = null) {
     if (loading || playing)
         return;
     loading = true;
     $('chooser').classList.add('loading');
     try {
-        await loadGame(files, name, withCheckpoints);
+        await loadGame(files, name, withCheckpoints, ownCheckpoints);
     } catch (e) {
         console.error(e);
         alert('Could not start the game: ' + e);
@@ -456,7 +481,7 @@ async function fetchCheckpoints(name) {
     }
 }
 
-async function loadGame(files, name, withCheckpoints) {
+async function loadGame(files, name, withCheckpoints, ownCheckpoints) {
     if ($('sound').checked)
         startAudio();
     wasm.web_clear_files();
@@ -474,7 +499,8 @@ async function loadGame(files, name, withCheckpoints) {
     savePrefs();
     wasm.web_audio_start($('sound').checked && audio ? audio.sampleRate : 0);
     webgl = $('renderer').value === 'webgl';
-    const checkpoints = webgl && withCheckpoints ? await fetchCheckpoints(name) : null;
+    const checkpoints = !webgl || !withCheckpoints ? null
+        : ownCheckpoints ? new TextDecoder().decode(await ownCheckpoints.read()) : await fetchCheckpoints(name);
     quality = $('quality').value in QUALITIES ? $('quality').value : 'high';
     $('screen').hidden = webgl;
     $('gl').hidden = $('overlay').hidden = !webgl;
@@ -719,7 +745,7 @@ function savePrefs() {
             scale: $('scale').value, fixice: $('fixice').checked, banner: $('banner').checked,
             sound: $('sound').checked, minimap: $('minimapOn').checked, renderer: $('renderer').value,
             quality: $('quality').value, frameskip: $('frameskip').checked,
-            distance: $('distance').value, source: $('source').value }));
+            distance: $('distance').value }));
     } catch (e) { /* private mode: not kept */ }
 }
 
@@ -735,7 +761,6 @@ function loadPrefs() {
         if (p.quality) $('quality').value = p.quality;
         if (p.frameskip !== undefined) $('frameskip').checked = p.frameskip;
         if (p.distance) $('distance').value = p.distance;
-        if (p.source) $('source').value = p.source;
     } catch (e) { /* nothing saved */ }
 }
 
@@ -797,29 +822,12 @@ function pick(promise) {
     $('status').textContent = '';
     promise.catch((e) => { $('status').textContent = 'Could not read the files: ' + e.message; });
 }
-async function openFiles(files) {
-    maps = findMaps(files);
-    const dirOf = (f) => f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '.';
-    const withCheckpoints = await checkpointFiles;
-    mapTitles = new Map(await Promise.all([...maps.keys()].map(async (dir) =>
-        [dir, (await trackTitle(files.filter((f) => dirOf(f) === dir)) || dir)
-              + (withCheckpoints.has(baseName(dir).toLowerCase()) ? CHECKPOINTS_MARK : '')])));
-    showMaps();
-}
-// Where the game is loaded from: the zip or a folder, each with its own file picker.
-function showSource(source) {
-    $('source').value = source;
-    $('fromZip').hidden = source !== 'zip';
-    $('fromFolder').hidden = source !== 'folder';
-}
-$('source').onchange = () => { showSource($('source').value); savePrefs(); };
-$('folder').onchange = (e) => pick(Promise.resolve([...e.target.files].map((f) => fromFile(f))).then(openFiles));
 $('zip').onchange = (e) => e.target.files.length && pick(openZip(e.target.files[0]));
 $('track').onchange = () => pick(pickTrack());
 $('carModel').onchange = () => {      // the texture of the same name, if there is one
     const stem = (c) => c.name.toLowerCase().replace(/\.[^.]*$/, '');
-    const car = anniversary.cars[+$('carModel').value];
-    const k = anniversary.textures.findIndex((t) => stem(t) === stem(car));
+    const car = zipped.cars[+$('carModel').value];
+    const k = zipped.textures.findIndex((t) => stem(t) === stem(car));
     if (k >= 0)
         $('carTexture').value = k;
     showTrack();
@@ -829,31 +837,35 @@ $('carTexture').onchange = () => {
     showTrack();
     pick(previewTexture());
 };
-$('playZip').onclick = () => play(anniversaryMap(), zipTrackName(track.choice));
-$('playZipCheckpoints').onclick = () => play(anniversaryMap(), zipTrackName(track.choice), true);
-// Dropped: a zip is the 30th Anniversary Edition's, anything else folders of maps.
+$('playZip').onclick = () => play(zipMap(), zipTrackName(track.choice));
+$('playZipCheckpoints').onclick = () => play(zipMap(), zipTrackName(track.choice), true, checkpointsOf(track.files));
+// Dropped: a zip, as if picked.
 addEventListener('dragover', (e) => { if (!playing) e.preventDefault(); });
 addEventListener('drop', (e) => {
     e.preventDefault();
     const items = e.dataTransfer.items, file = items.length === 1 && items[0].getAsFile();
     if (playing)
         return;
-    const zip = file && /\.zip$/i.test(file.name);
-    showSource(zip ? 'zip' : 'folder');
-    pick(zip ? openZip(file) : droppedFiles(items).then(openFiles));
+    if (file && /\.zip$/i.test(file.name))
+        pick(openZip(file));
+    else
+        $('status').textContent = 'Drop a zip: the 30th Anniversary Edition\'s, a megapack\'s or a map\'s.';
 });
 $('distance').oninput = () => { $('distanceText').textContent = $('distance').value + ' tiles'; };
 $('quality').value = touchScreen ? 'medium' : 'high';    // a phone's GPU: until something else is chosen
 loadPrefs();
-showSource($('source').value);
 // Only the options of the chosen renderer: the scale is the software one's,
 // the quality and the draw distance the OpenGL one's.
 function showRendererOptions() {
     const gl = $('renderer').value === 'webgl';
+    for (const tab of document.querySelectorAll('[data-renderer]'))
+        tab.setAttribute('aria-selected', tab.dataset.renderer === $('renderer').value);
     for (const e of document.querySelectorAll('.gl-only')) e.hidden = !gl;
     for (const e of document.querySelectorAll('.sw-only')) e.hidden = gl;
 }
-$('renderer').onchange = () => { showRendererOptions(); showMaps(); if (anniversary) showTrack(); };
+$('renderer').onchange = () => { showRendererOptions(); if (zipped) showTrack(); };
+for (const tab of document.querySelectorAll('[data-renderer]'))     // the tabs choose the renderer
+    tab.onclick = () => { $('renderer').value = tab.dataset.renderer; $('renderer').onchange(); savePrefs(); };
 showRendererOptions();
 $('distance').oninput();
 load().catch((e) => { $('status').textContent = 'Could not load terep2.wasm: ' + e; });
